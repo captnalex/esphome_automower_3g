@@ -1,0 +1,969 @@
+# Husqvarna Automower 310 / ESP32-C3 Super Mini - ESPHome v3.8, shareable edition
+# Original credits: Robomower V0.8, Wall-E v1.20 and AMConnect diagnostic ideas.
+# AUX1: pin 1 -> GPIO4 RX; pin 2 -> GPIO5 TX; pin 3 -> GND; pin 6 -> 5 V.
+# Verify connector orientation and signal levels on your mower before wiring.
+# Pin 6 current capacity and power during sleep are not verified.
+# NEVER connect AUX1 pin 7 (approximately 18 V) directly to the ESP32 board.
+# No GPS, wake relay or automatic START on boot. A mode change may cause motion.
+# Manual clock sync only; parked/charging status, accepted PIN and HA time required.
+# Original testing confirmed clock writes while charging, not while mowing.
+# One polling slot per 200 ms: status, wheels and blade every 2 seconds.
+# Other groups: sensors 5 s; battery/cover 10 s; clock/next start 60 s; date 1 hour.
+# After loss of communication: status polling every 5 seconds; no wake capability.
+# Old measurements are historical when the connection is lost.
+# See README.md for ESPHome app setup, secrets, wiring and safety limitations.
+
+substitutions:
+  automower_pin: !secret automower_pin
+
+esphome:
+  name: automower-310
+  friendly_name: Automower 310
+  on_boot:
+    priority: -100
+    then:
+      - text_sensor.template.publish:
+          id: pin_status
+          state: "Waiting for mower"
+      - text_sensor.template.publish:
+          id: last_control_command
+          state: "None"
+
+esp32:
+  variant: esp32c3
+  framework:
+    type: esp-idf
+    advanced:
+      flash_chip: generic
+
+logger:
+  level: DEBUG
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: Europe/Oslo
+
+# Frames: start, command, payload length, payload, Dallas CRC8, end.
+uart:
+  id: mower_uart
+  tx_pin: GPIO5
+  rx_pin: GPIO4
+  baud_rate: 115200
+  data_bits: 8
+  stop_bits: 1
+  parity: NONE
+  rx_buffer_size: 512
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      timeout: 25ms
+    sequence:
+      - lambda: |-
+          static std::vector<uint8_t> receive_buffer;
+          for (uint8_t value : bytes) receive_buffer.push_back(value);
+
+          while (receive_buffer.size() >= 5) {
+            if (receive_buffer[0] != 0x02) {
+              receive_buffer.erase(receive_buffer.begin());
+              continue;
+            }
+            const size_t data_length = receive_buffer[2];
+            const size_t total = data_length + 5;
+            if (data_length > 64) {
+              receive_buffer.erase(receive_buffer.begin());
+              continue;
+            }
+            if (receive_buffer.size() < total) break;
+            if (receive_buffer[total - 1] != 0x03) {
+              receive_buffer.erase(receive_buffer.begin());
+              continue;
+            }
+
+            uint8_t crc = 0;
+            for (size_t i = 1; i < total - 2; i++) {
+              uint8_t value = receive_buffer[i];
+              for (int bit = 0; bit < 8; bit++) {
+                const bool mix = (crc ^ value) & 0x01;
+                crc >>= 1;
+                if (mix) crc ^= 0x8C;
+                value >>= 1;
+              }
+            }
+            if (crc != receive_buffer[total - 2]) {
+              id(crc_error_count)++;
+              ESP_LOGW("automower", "CRC error (command 0x%02X)", receive_buffer[1]);
+              receive_buffer.erase(receive_buffer.begin());
+              continue;
+            }
+
+            const uint8_t command = receive_buffer[1];
+            const uint8_t response = data_length > 0 ? receive_buffer[3] : 0xFF;
+            const uint32_t now_ms = millis();
+            if (id(last_response_ms) != 0 &&
+                (uint32_t)(now_ms - id(last_response_ms)) > 60000) {
+              id(pin_accepted) = false;
+              id(pin_requested) = false;
+              id(pin_status).publish_state("Waiting for reauthentication");
+            }
+            id(last_response_ms) = now_ms;
+            id(connection_loss_reported) = false;
+            ESP_LOGV("automower", "Valid UART 0x%02X, status=0x%02X, length=%u",
+                     command, response, (unsigned)data_length);
+
+            if (command == 0x0D && data_length >= 1) {
+              id(pin_accepted) = (response == 0);
+              id(pin_status).publish_state(id(pin_accepted) ? "Accepted" : "Rejected");
+            }
+            if (command == 0x0F && data_length >= 1 && id(waiting_for_mode)) {
+              id(mode_acknowledged) = (response == 0);
+              id(mode_response_ready) = true;
+              id(waiting_for_mode) = false;
+            }
+            if (command == 0x03 && id(clock_sync_pending)) {
+              if (response != 0) {
+                id(clock_sync_pending) = false;
+                id(clock_sync_readback_sent) = false;
+                char message[48];
+                snprintf(message, sizeof(message), "Clock sync rejected (0x%02X)", unsigned(response));
+                id(last_control_command).publish_state(message);
+                ESP_LOGW("automower", "Clock sync rejected by mower: status 0x%02X", unsigned(response));
+              } else if (id(clock_sync_readback_sent) && data_length == 4 &&
+                         receive_buffer[4] <= 23 && receive_buffer[5] <= 59 &&
+                         receive_buffer[6] <= 59) {
+                auto current_time = id(ha_time).now();
+                if (current_time.is_valid()) {
+                  const int mower_seconds = int(receive_buffer[4]) * 3600 +
+                                          int(receive_buffer[5]) * 60 + int(receive_buffer[6]);
+                  const int ha_seconds = int(current_time.hour) * 3600 +
+                                     int(current_time.minute) * 60 + int(current_time.second);
+                  int difference = mower_seconds > ha_seconds ? mower_seconds - ha_seconds : ha_seconds - mower_seconds;
+                  if (difference > 43200) difference = 86400 - difference;
+                  id(clock_sync_pending) = false;
+                  id(clock_sync_readback_sent) = false;
+                  if (difference <= 8) {
+                    id(last_control_command).publish_state("Clock sync confirmed");
+                    ESP_LOGI("automower", "Clock sync confirmed by readback (difference %d s)", difference);
+                  } else {
+                    id(last_control_command).publish_state("Clock sync failed - time mismatch");
+                    ESP_LOGW("automower", "Clock sync failed: mower %02u:%02u:%02u, HA %02u:%02u:%02u (difference %d s)",
+                             unsigned(receive_buffer[4]), unsigned(receive_buffer[5]), unsigned(receive_buffer[6]),
+                             unsigned(current_time.hour), unsigned(current_time.minute), unsigned(current_time.second), difference);
+                  }
+                }
+              }
+            }
+
+            if (response != 0) {
+              id(rejected_response_count)++;
+              ESP_LOGW("automower", "Rejected response 0x%02X, status 0x%02X", command, response);
+              receive_buffer.erase(receive_buffer.begin(), receive_buffer.begin() + total);
+              continue;
+            }
+
+            if (command == 0x13 && data_length >= 2) {
+              id(last_status_ms) = now_ms;
+              const uint8_t operating_state = receive_buffer[4];
+              const char *text = "Unknown";
+              switch (operating_state) {
+                case 1: text = "Parked"; break;
+                case 2: text = "Mowing"; break;
+                case 3: text = "Returning"; break;
+                case 4: text = "Charging"; break;
+                case 5: text = "Searching"; break;
+                case 7: text = "Error"; break;
+              }
+              if (id(operating_status).state != text) id(operating_status).publish_state(text);
+              id(mower_active).publish_state(operating_state == 2);
+              id(mower_error).publish_state(operating_state == 7);
+              id(mower_moving).publish_state(operating_state == 2 || operating_state == 3 || operating_state == 5);
+
+              if (data_length >= 5) {
+                const char *mode = "Unknown";
+                if (operating_state == 1) {
+                  switch (receive_buffer[7] >> 4) {
+                    case 0: mode = "AUTO"; break;
+                    case 1: mode = "MAN"; break;
+                    case 2: mode = "HOME"; break;
+                  }
+                } else {
+                  switch (receive_buffer[6]) {
+                    case 0x06: mode = "AUTO"; break;
+                    case 0x07: mode = "MAN"; break;
+                    case 0x08: mode = "HOME"; break;
+                  }
+                }
+                if (id(operating_mode).state != mode) id(operating_mode).publish_state(mode);
+                if (strcmp(mode, "Unknown") != 0 &&
+                    (!id(select_operating_mode).has_state() ||
+                     id(select_operating_mode).current_option() != mode)) {
+                  id(select_operating_mode).publish_state(mode);
+                }
+                if (operating_state == 2) {
+                  id(blade_motor_active).publish_state(receive_buffer[5] == 0x01);
+                } else {
+                  id(blade_motor_active).publish_state(false);
+                }
+              }
+              if (data_length >= 19) {
+                static uint32_t last_hours_publish_ms = 0;
+                static uint32_t last_battery_publish_ms = 0;
+                if (last_hours_publish_ms == 0 ||
+                    (uint32_t)(now_ms - last_hours_publish_ms) >= 60000) {
+                  const uint16_t hours = uint16_t(receive_buffer[19]) |
+                                         (uint16_t(receive_buffer[20]) << 8);
+                  id(operating_hours).publish_state(hours);
+                  last_hours_publish_ms = now_ms;
+                }
+                if (receive_buffer[21] <= 100 &&
+                    (last_battery_publish_ms == 0 ||
+                     (uint32_t)(now_ms - last_battery_publish_ms) >= 10000)) {
+                  id(battery_percent).publish_state(receive_buffer[21]);
+                  last_battery_publish_ms = now_ms;
+                }
+              }
+              if (operating_state == 7 && data_length >= 6) {
+                const uint8_t a = receive_buffer[6], b = receive_buffer[7], c = receive_buffer[8];
+                char error[24];
+                snprintf(error, sizeof(error), "%02X-%02X-%02X", a, b, c);
+                if (id(error_code).state != error) id(error_code).publish_state(error);
+                const char *description = "Unknown error (see raw code)";
+                if (a == 0x05 && ((b == 0x13 && c == 0x00) || (b == 0x01 && c == 0x27)))
+                  description = "Outside working area";
+                else if (a == 0x06 && b == 0x01 && c == 0x00)
+                  description = "Mower stopped";
+                else if (a == 0x06 && b == 0x01 && c == 0x27)
+                  description = "Mower tilted";
+                else if (a == 0x05 && b == 0x21 && c == 0x27)
+                  description = "Mower lifted";
+                else if (a == 0x07 && b == 0x12 && c == 0x00)
+                  description = "Blades blocked";
+                if (id(error_description).state != description) id(error_description).publish_state(description);
+              } else if (operating_state != 7) {
+                if (id(error_code).state != "None") id(error_code).publish_state("None");
+                if (id(error_description).state != "None") id(error_description).publish_state("None");
+              }
+            }
+
+            if (command == 0x15) {
+              if (data_length == 21) {
+                const uint16_t mv = uint16_t(receive_buffer[4]) |
+                                    (uint16_t(receive_buffer[5]) << 8);
+                const int16_t capacity = int16_t(uint16_t(receive_buffer[6]) |
+                                                  (uint16_t(receive_buffer[7]) << 8));
+                const int16_t ma = int16_t(uint16_t(receive_buffer[8]) |
+                                          (uint16_t(receive_buffer[9]) << 8));
+                id(battery_voltage).publish_state(mv / 1000.0f);
+                id(battery_current).publish_state(ma);
+                static uint32_t last_slow_battery_ms = 0;
+                if (last_slow_battery_ms == 0 ||
+                    (uint32_t)(now_ms - last_slow_battery_ms) >= 30000) {
+                  id(battery_capacity).publish_state(capacity);
+                  id(battery_temperature).publish_state(receive_buffer[10] / 10.0f +
+                                                       receive_buffer[11] * 25.5f);
+                  last_slow_battery_ms = now_ms;
+                }
+              } else if (data_length == 15) {
+                const auto word = [&](size_t index) -> uint16_t {
+                  return uint16_t(receive_buffer[index]) |
+                         (uint16_t(receive_buffer[index + 1]) << 8);
+                };
+                id(left_power).publish_state(int16_t(word(4)));
+                id(left_speed).publish_state(int16_t(word(6)));
+                id(left_current).publish_state(int16_t(word(8)));
+                id(right_power).publish_state(int16_t(word(10)));
+                id(right_speed).publish_state(int16_t(word(12)));
+                id(right_current).publish_state(int16_t(word(14)));
+              } else if (data_length == 7) {
+                const uint16_t rpm = uint16_t(receive_buffer[4]) |
+                                     (uint16_t(receive_buffer[5]) << 8);
+                const int16_t ma = int16_t(uint16_t(receive_buffer[6]) |
+                                           (uint16_t(receive_buffer[7]) << 8));
+                id(blade_motor_speed).publish_state(rpm);
+                id(blade_motor_current).publish_state(ma);
+              } else if (data_length == 12) {
+                const auto signed_word = [&](size_t index) -> int16_t {
+                  return int16_t(uint16_t(receive_buffer[index]) |
+                                 (uint16_t(receive_buffer[index + 1]) << 8));
+                };
+                id(collision_sensor).publish_state(receive_buffer[4] == 0x03);
+                id(lift_sensor).publish_state(receive_buffer[5] == 0x03);
+                id(tilt_x).publish_state(signed_word(6) / 10.0f);
+                id(tilt_y).publish_state(signed_word(8) / 10.0f);
+                id(tilt_z).publish_state(signed_word(10) / 10.0f);
+                id(abnormal_position).publish_state(receive_buffer[12] != 0);
+              } else if (data_length == 4 &&
+                         receive_buffer[4] == 0 && receive_buffer[5] == 1) {
+                id(cover_status).publish_state(
+                  receive_buffer[6] == 1 ? "Open" :
+                  (receive_buffer[6] == 0 ? "Closed" : "Unknown"));
+              } else {
+                ESP_LOGD("automower", "Unknown sensor response, data length=%u", (unsigned)data_length);
+              }
+            }
+
+            if (command == 0x03 && data_length == 4 &&
+                receive_buffer[4] <= 23 && receive_buffer[5] <= 59 && receive_buffer[6] <= 59) {
+              char clock[16];
+              snprintf(clock, sizeof(clock), "%02u:%02u:%02u",
+                       receive_buffer[4], receive_buffer[5], receive_buffer[6]);
+              id(mower_clock).publish_state(clock);
+            }
+            if (command == 0x03 && data_length == 6 &&
+                receive_buffer[6] >= 1 && receive_buffer[6] <= 12 &&
+                receive_buffer[7] >= 1 && receive_buffer[7] <= 31) {
+              const unsigned year = uint16_t(receive_buffer[4]) |
+                                   (uint16_t(receive_buffer[5]) << 8);
+              char date[20];
+              snprintf(date, sizeof(date), "%02u.%02u.%04u",
+                       receive_buffer[7], receive_buffer[6], year);
+              id(mower_date).publish_state(date);
+            }
+            if (command == 0x07 && data_length == 10) {
+              uint32_t epoch = uint32_t(receive_buffer[9]) |
+                               (uint32_t(receive_buffer[10]) << 8) |
+                               (uint32_t(receive_buffer[11]) << 16) |
+                               (uint32_t(receive_buffer[12]) << 24);
+              if (epoch == 0) {
+                id(next_start_unix).publish_state("Not scheduled");
+              } else {
+                char timestamp[16];
+                snprintf(timestamp, sizeof(timestamp), "%lu", (unsigned long)epoch);
+                id(next_start_unix).publish_state(timestamp);
+              }
+            }
+
+            receive_buffer.erase(receive_buffer.begin(), receive_buffer.begin() + total);
+          }
+          if (receive_buffer.size() > 512) receive_buffer.clear();
+
+globals:
+  - id: last_response_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_status_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: crc_error_count
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: rejected_response_count
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: pin_accepted
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: pin_requested
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: waiting_for_mode
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: mode_acknowledged
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: mode_response_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: connection_loss_reported
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: clock_sync_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: clock_sync_readback_sent
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: clock_sync_hour
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: clock_sync_minute
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: clock_sync_second
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+text_sensor:
+  - platform: template
+    update_interval: never
+    name: "Operating status"
+    id: operating_status
+  - platform: template
+    update_interval: never
+    name: "Operating mode"
+    id: operating_mode
+    internal: true
+  - platform: template
+    update_interval: never
+    name: "Error code (raw)"
+    id: error_code
+  - platform: template
+    update_interval: never
+    name: "Error description"
+    id: error_description
+  - platform: template
+    update_interval: never
+    name: "PIN authentication"
+    id: pin_status
+    entity_category: diagnostic
+  - platform: template
+    update_interval: never
+    name: "Last control command"
+    id: last_control_command
+    entity_category: diagnostic
+  - platform: template
+    update_interval: never
+    name: "Cover status"
+    id: cover_status
+  - platform: template
+    update_interval: never
+    name: "Mower clock"
+    id: mower_clock
+  - platform: template
+    update_interval: never
+    name: "Mower date"
+    id: mower_date
+  - platform: template
+    update_interval: never
+    name: "Next start (Unix time)"
+    id: next_start_unix
+
+sensor:
+  - platform: template
+    update_interval: never
+    name: "Battery"
+    id: battery_percent
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Battery voltage"
+    id: battery_voltage
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+  - platform: template
+    update_interval: never
+    name: "Battery current"
+    id: battery_current
+    unit_of_measurement: "mA"
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Battery capacity"
+    id: battery_capacity
+    unit_of_measurement: "mAh"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Battery temperature"
+    id: battery_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    update_interval: never
+    name: "Operating hours"
+    id: operating_hours
+    unit_of_measurement: "h"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Left wheel - power"
+    id: left_power
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Left wheel - speed"
+    id: left_speed
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Left wheel - current"
+    id: left_current
+    unit_of_measurement: "mA"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Right wheel - power"
+    id: right_power
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Right wheel - speed"
+    id: right_speed
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Right wheel - current"
+    id: right_current
+    unit_of_measurement: "mA"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Blade motor - speed"
+    id: blade_motor_speed
+    unit_of_measurement: "rpm"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Blade motor - current"
+    id: blade_motor_current
+    unit_of_measurement: "mA"
+    accuracy_decimals: 0
+  - platform: template
+    update_interval: never
+    name: "Tilt X"
+    id: tilt_x
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+  - platform: template
+    update_interval: never
+    name: "Tilt Y"
+    id: tilt_y
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+  - platform: template
+    update_interval: never
+    name: "Tilt Z"
+    id: tilt_z
+    unit_of_measurement: "°"
+    accuracy_decimals: 1
+  - platform: wifi_signal
+    name: "WiFi signal"
+    entity_category: diagnostic
+    update_interval: 30s
+  - platform: uptime
+    name: "ESP32 uptime"
+    entity_category: diagnostic
+    update_interval: 60s
+  - platform: template
+    name: "UART CRC errors"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: 'return id(crc_error_count);'
+  - platform: template
+    name: "UART rejected responses"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: 'return id(rejected_response_count);'
+  - platform: template
+    name: "Seconds since last valid response"
+    entity_category: diagnostic
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(last_response_ms) == 0) return NAN;
+      return (uint32_t)(millis() - id(last_response_ms)) / 1000.0f;
+  - platform: template
+    name: "Seconds since last status"
+    entity_category: diagnostic
+    unit_of_measurement: "s"
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      if (id(last_status_ms) == 0) return NAN;
+      return (uint32_t)(millis() - id(last_status_ms)) / 1000.0f;
+
+binary_sensor:
+  - platform: template
+    name: "Mower communication"
+    id: communication
+    lambda: |-
+      return id(last_response_ms) != 0 &&
+             (uint32_t)(millis() - id(last_response_ms)) < 60000;
+  - platform: template
+    name: "Mower active"
+    id: mower_active
+  - platform: template
+    name: "Mower error"
+    id: mower_error
+    device_class: problem
+  - platform: template
+    name: "Mower moving"
+    id: mower_moving
+  - platform: template
+    name: "Blade motor active"
+    id: blade_motor_active
+  - platform: template
+    name: "Collision sensor"
+    id: collision_sensor
+  - platform: template
+    name: "Lift sensor"
+    id: lift_sensor
+  - platform: template
+    name: "Abnormal position"
+    id: abnormal_position
+    device_class: problem
+
+script:
+  - id: synchronize_clock
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(ha_time).now().is_valid() &&
+                     id(pin_accepted) &&
+                     id(last_response_ms) != 0 &&
+                     (uint32_t)(millis() - id(last_response_ms)) < 30000 &&
+                     id(last_status_ms) != 0 &&
+                     (uint32_t)(millis() - id(last_status_ms)) < 30000 &&
+                     (id(operating_status).state == "Charging" ||
+                      id(operating_status).state == "Parked") &&
+                     !id(change_mode).is_running();
+          then:
+            - lambda: |-
+                auto now_ms = id(ha_time).now();
+                if (now_ms.hour > 23 || now_ms.minute > 59 || now_ms.second > 59) {
+                  ESP_LOGE("automower", "Invalid time from Home Assistant");
+                  return;
+                }
+                id(clock_sync_hour) = uint8_t(now_ms.hour);
+                id(clock_sync_minute) = uint8_t(now_ms.minute);
+                id(clock_sync_second) = uint8_t(now_ms.second);
+                id(clock_sync_pending) = true;
+                id(clock_sync_readback_sent) = false;
+                uint8_t telegram[9] = {
+                  0x02, 0x02, 0x04, 0x80,
+                  id(clock_sync_hour), id(clock_sync_minute), id(clock_sync_second),
+                  0x00, 0x03
+                };
+                uint8_t crc = 0;
+                for (size_t i = 1; i <= 6; i++) {
+                  uint8_t value = telegram[i];
+                  for (int bit = 0; bit < 8; bit++) {
+                    const bool mix = (crc ^ value) & 0x01;
+                    crc >>= 1;
+                    if (mix) crc ^= 0x8C;
+                    value >>= 1;
+                  }
+                }
+                telegram[7] = crc;
+                id(mower_uart).write_array(telegram, sizeof(telegram));
+                id(last_control_command).publish_state("Clock sync sent - waiting for response");
+                ESP_LOGI("automower", "Setting mower clock to %02u:%02u:%02u",
+                         unsigned(now_ms.hour), unsigned(now_ms.minute), unsigned(now_ms.second));
+            - delay: 2s
+            - if:
+                condition:
+                  lambda: 'return id(clock_sync_pending);'
+                then:
+                  - lambda: 'id(clock_sync_readback_sent) = true;'
+                  - uart.write:
+                      id: mower_uart
+                      data: [0x02, 0x02, 0x01, 0x00, 0x8B, 0x03]
+            - delay: 3s
+            - lambda: |-
+                if (id(clock_sync_pending)) {
+                  id(clock_sync_pending) = false;
+                  id(clock_sync_readback_sent) = false;
+                  id(last_control_command).publish_state("Clock sync not confirmed (timeout)");
+                  ESP_LOGW("automower", "Clock sync: no confirmed readback after write attempt");
+                }
+          else:
+            - text_sensor.template.publish:
+                id: last_control_command
+                state: "Clock sync requires parked/charging, PIN and connection"
+            - logger.log:
+                level: WARN
+                format: "Clock sync blocked: requires parked/charging, accepted PIN, fresh AUX status and HA time"
+
+  # PIN is converted from decimal text; leading zeros are preserved in configuration.
+  # Never log the PIN or expose it as a Home Assistant entity.
+  - id: authenticate
+    mode: restart
+    then:
+      - lambda: |-
+          const std::string pin_text = "${automower_pin}";
+          id(pin_accepted) = false;
+          id(pin_requested) = true;
+          if (pin_text.size() != 4 ||
+              pin_text.find_first_not_of("0123456789") != std::string::npos) {
+            id(pin_status).publish_state("Invalid PIN configuration: four digits required");
+            ESP_LOGE("automower", "Invalid PIN configuration; authentication not sent");
+            return;
+          }
+          uint16_t pin = 0;
+          for (char digit : pin_text) pin = pin * 10 + (digit - '0');
+          id(pin_status).publish_state("Waiting for response");
+          uint8_t telegram[9] = {0x02, 0x0C, 0x04, 0x00, 0x01,
+                                 uint8_t(pin & 0xFF), uint8_t(pin >> 8), 0x00, 0x03};
+          uint8_t crc = 0;
+          for (int i = 1; i <= 6; i++) {
+            uint8_t value = telegram[i];
+            for (int bit = 0; bit < 8; bit++) {
+              const bool mix = (crc ^ value) & 0x01;
+              crc >>= 1;
+              if (mix) crc ^= 0x8C;
+              value >>= 1;
+            }
+          }
+          telegram[7] = crc;
+          id(mower_uart).write_array(telegram, sizeof(telegram));
+
+  # A mode command does not send a separate START command.
+  - id: change_mode
+    mode: single
+    parameters:
+      mode: int
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(pin_accepted) &&
+                     !id(synchronize_clock).is_running() &&
+                     id(last_response_ms) != 0 &&
+                     (uint32_t)(millis() - id(last_response_ms)) < 30000;
+          then:
+            - lambda: |-
+                id(mode_response_ready) = false;
+                id(mode_acknowledged) = false;
+                id(waiting_for_mode) = true;
+                const uint8_t home[]  = {0x02,0x0E,0x01,0x02,0x8C,0x03};
+                const uint8_t man[]   = {0x02,0x0E,0x01,0x03,0xD2,0x03};
+                const uint8_t auto_[] = {0x02,0x0E,0x01,0x04,0x51,0x03};
+                if (mode == 2) id(mower_uart).write_array(home, sizeof(home));
+                else if (mode == 3) id(mower_uart).write_array(man, sizeof(man));
+                else if (mode == 4) id(mower_uart).write_array(auto_, sizeof(auto_));
+                else id(waiting_for_mode) = false;
+            - wait_until:
+                condition:
+                  lambda: 'return id(mode_response_ready);'
+                timeout: 5s
+            - if:
+                condition:
+                  lambda: 'return id(mode_response_ready) && id(mode_acknowledged);'
+                then:
+                  - lambda: |-
+                      const char *name = mode == 2 ? "HOME" : (mode == 3 ? "MAN" : "AUTO");
+                      char text[64];
+                      snprintf(text, sizeof(text), "Mode %s confirmed (no START sent)", name);
+                      id(last_control_command).publish_state(text);
+                      ESP_LOGI("automower", "Mode command %s confirmed; no separate START sent", name);
+                else:
+                  - text_sensor.template.publish:
+                      id: last_control_command
+                      state: "Mode not confirmed"
+                  - logger.log:
+                      level: WARN
+                      format: "Mode not confirmed: rejected or no acknowledgement"
+            - lambda: 'id(waiting_for_mode) = false;'
+            - uart.write:
+                id: mower_uart
+                data: [0x02, 0x12, 0x01, 0x01, 0x9F, 0x03]
+          else:
+            - text_sensor.template.publish:
+                id: last_control_command
+                state: "Mode blocked (PIN/connection)"
+            - logger.log:
+                level: WARN
+                format: "Mode change blocked: PIN or AUX connection missing"
+
+select:
+  - platform: template
+    name: "Select operating mode"
+    id: select_operating_mode
+    icon: mdi:robot-mower
+    options:
+      - "AUTO"
+      - "MAN"
+      - "HOME"
+    optimistic: false
+    update_interval: never
+    lambda: |-
+      return {};
+    set_action:
+      - lambda: |-
+          if (x != "AUTO" && x != "MAN" && x != "HOME") return;
+          if (!id(pin_accepted) ||
+              id(last_response_ms) == 0 ||
+              (uint32_t)(millis() - id(last_response_ms)) >= 30000 ||
+              id(change_mode).is_running() ||
+              id(synchronize_clock).is_running()) {
+            id(last_control_command).publish_state("Mode blocked (PIN/connection/busy)");
+            ESP_LOGW("automower", "Mode selection blocked: %s", x.c_str());
+            return;
+          }
+          const int mode = x == "HOME" ? 2 : (x == "MAN" ? 3 : 4);
+          char message[48];
+          snprintf(message, sizeof(message), "Mode %s requested", x.c_str());
+          id(last_control_command).publish_state(message);
+          id(change_mode)->execute(mode);
+
+button:
+  - platform: template
+    name: "Synchronize clock"
+    icon: mdi:clock-sync
+    on_press:
+      - script.execute: synchronize_clock
+  - platform: template
+    name: "Authenticate PIN"
+    on_press:
+      - script.execute: authenticate
+  - platform: template
+    name: "Stop mower"
+    on_press:
+      - script.stop: change_mode
+      - script.stop: synchronize_clock
+      - lambda: |-
+          id(waiting_for_mode) = false;
+          id(clock_sync_pending) = false;
+          id(clock_sync_readback_sent) = false;
+      - text_sensor.template.publish:
+          id: last_control_command
+          state: "STOP requested"
+      - uart.write:
+          id: mower_uart
+          data: [0x02, 0x0E, 0x01, 0x00, 0x30, 0x03]
+  - platform: template
+    name: "Start mower"
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(pin_accepted) && !id(change_mode).is_running() && !id(synchronize_clock).is_running() && id(last_response_ms) != 0 && (uint32_t)(millis() - id(last_response_ms)) < 30000;'
+          then:
+            - uart.write:
+                id: mower_uart
+                data: [0x02, 0x0E, 0x01, 0x01, 0x6E, 0x03]
+            - text_sensor.template.publish:
+                id: last_control_command
+                state: "START requested"
+          else:
+            - logger.log:
+                level: WARN
+                format: "START blocked: PIN, missing connection or another command in progress"
+  - platform: template
+    name: "Refresh status"
+    on_press:
+      - uart.write:
+          id: mower_uart
+          data: [0x02, 0x12, 0x01, 0x01, 0x9F, 0x03]
+
+# Pause regular polling while a mode change or clock synchronization is running.
+interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (id(last_response_ms) != 0 &&
+              (uint32_t)(millis() - id(last_response_ms)) >= 60000 &&
+              !id(connection_loss_reported)) {
+            id(connection_loss_reported) = true;
+            id(pin_accepted) = false;
+            id(pin_requested) = false;
+            id(clock_sync_pending) = false;
+            id(clock_sync_readback_sent) = false;
+            id(pin_status).publish_state("No connection");
+            id(operating_status).publish_state("No connection");
+            ESP_LOGW("automower", "No valid UART response for 60 seconds");
+          }
+  - interval: 200ms
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(change_mode).is_running() &&
+                     !id(synchronize_clock).is_running();
+          then:
+            - lambda: |-
+                static const uint8_t status[]   = {0x02,0x12,0x01,0x01,0x9F,0x03};
+                static const uint8_t battery[]  = {0x02,0x14,0x01,0x01,0x4E,0x03};
+                static const uint8_t wheels[]     = {0x02,0x14,0x01,0x02,0xAC,0x03};
+                static const uint8_t blade[]     = {0x02,0x14,0x01,0x03,0xF2,0x03};
+                static const uint8_t sensors[] = {0x02,0x14,0x01,0x04,0x71,0x03};
+                static const uint8_t cover[]   = {0x02,0x14,0x01,0x05,0x2F,0x03};
+                static const uint8_t clock[]   = {0x02,0x02,0x01,0x00,0x8B,0x03};
+                static const uint8_t date[]     = {0x02,0x02,0x01,0x01,0xD5,0x03};
+                static const uint8_t next_start[]    = {0x02,0x06,0x01,0x05,0x2A,0x03};
+
+                if (id(last_response_ms) != 0 &&
+                    (uint32_t)(millis() - id(last_response_ms)) < 30000 &&
+                    !id(pin_requested) && !id(pin_accepted)) {
+                  id(authenticate).execute();
+                  return;
+                }
+
+                const uint32_t now_ms = millis();
+                const bool active_connection = id(last_response_ms) != 0 &&
+                    (uint32_t)(now_ms - id(last_response_ms)) < 60000;
+                static uint8_t no_connection_counter = 0;
+                if (!active_connection) {
+                  if (++no_connection_counter < 25) return;
+                  no_connection_counter = 0;
+                  id(mower_uart).write_array(status, sizeof(status));
+                  return;
+                }
+                no_connection_counter = 0;
+
+                static uint8_t slot = 0;
+                const uint8_t current_slot = slot;
+                slot = (slot + 1) % 10;
+                if (current_slot == 0) {
+                  id(mower_uart).write_array(status, sizeof(status));
+                  return;
+                }
+                if (current_slot == 3) {
+                  id(mower_uart).write_array(wheels, sizeof(wheels));
+                  return;
+                }
+                if (current_slot == 6) {
+                  id(mower_uart).write_array(blade, sizeof(blade));
+                  return;
+                }
+
+                static uint32_t last_request[6] = {0,0,0,0,0,0};
+                static const uint32_t periods[6] = {
+                  5000, 10000, 10000, 60000, 60000, 3600000
+                };
+                const uint8_t *messages[6] = {
+                  sensors, battery, cover, clock, next_start, date
+                };
+                for (uint8_t i = 0; i < 6; i++) {
+                  if (last_request[i] == 0 || (uint32_t)(now_ms - last_request[i]) >= periods[i]) {
+                    id(mower_uart).write_array(messages[i], 6);
+                    last_request[i] = now_ms;
+                    break;
+                  }
+                }

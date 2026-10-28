@@ -1,0 +1,13 @@
+secrets.yaml
+secrets.yml
+**/secrets.yaml
+**/secrets.yml
+.esphome/
+.pioenvs/
+.piolibdeps/
+*.bin
+*.elf
+*.log
+.venv/
+__pycache__/
+.DS_Store
