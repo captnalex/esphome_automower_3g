@@ -1,5 +1,7 @@
 # Automower 310 with ESPHome and ESP32-C3
 
+Please note that this whole project is vibecoded with ChatGPT.
+
 An unofficial Home Assistant integration for the Husqvarna Automower 310, using its AUX1 UART interface and an ESP32-C3 Super Mini. Based on the original v3.8 smart-polling configuration. This is a hobby project, not a Husqvarna product.
 
 The repository name refers to Generation 3. Compatibility with every Gen3 model is **not** confirmed.
