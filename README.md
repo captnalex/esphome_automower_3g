@@ -1,6 +1,6 @@
 # Automower 310 with ESPHome and ESP32-C3
 
-Please note that this whole project is vibecoded with ChatGPT.
+**All project code was generated with ChatGPT.** Hardware observations and installation photos were provided by the owner. AI-generated code can contain errors; review and test it before use.
 
 An unofficial Home Assistant integration for the Husqvarna Automower 310, using its AUX1 UART interface and an ESP32-C3 Super Mini. Based on the original v3.8 smart-polling configuration. This is a hobby project, not a Husqvarna product.
 
@@ -54,6 +54,32 @@ python check_frames.py
 python check_config.py
 ```
 
+## Shopping list
+
+Parts used in the owner's installation:
+
+| Quantity | Part | Link / notes |
+| --- | --- | --- |
+| 1 | 8-pin Micro-MaTch connector / cable | [Owner's Micro-MaTch 8P listing](https://www.aliexpress.com/item/1005013047292562.html). Select the 8-pin version and check connector orientation. |
+| 1 | ESP32-C3 board | [Owner's ESP32 listing](https://www.aliexpress.com/item/1005012967946988.html). The YAML targets ESP32-C3 with GPIO4 RX / GPIO5 TX; select the matching variant, including an external antenna connector if using the illustrated antenna. |
+| 1 set | Compatible 2.4 GHz Wi-Fi antenna and antenna cable | Required for the illustrated external-antenna installation; check whether included with the board and match its RF connector. |
+| As needed | Hook-up wire / ribbon cable, insulation and mounting adhesive | Connect RX, TX, GND and 5 V, secure the board, and provide cable strain relief. |
+| 1 | USB data cable | For initial firmware installation. |
+
+These are owner-supplied shopping links, not independently verified product specifications. Listings can offer several variants; check the selected options before ordering. Prices and availability are not tracked.
+
+## Installation photos
+
+The owner glued the ESP32 to the **inside side wall of the mower**. The antenna is secured at the **bottom of the mower in an existing clip**. Route wiring clear of moving parts and the enclosure seal, insulate exposed connections, and provide strain relief. The photos illustrate this installation rather than a universal mounting requirement.
+
+![ESP32 glued to the inside side wall, connected to AUX1 by ribbon cable](docs/images/esp32-side-mount.jpg)
+
+*ESP32 mounting on the side wall and AUX1 cable routing.*
+
+<img src="docs/images/antenna-bottom-clip.jpg" alt="Wi-Fi antenna secured in an existing clip at the bottom of the mower" width="420">
+
+*Antenna held in an existing clip at the bottom of the mower.*
+
 ## Wiring
 
 The following AUX1 connections were reported physically tested on the original Automower 310. **Check connector orientation, board revision and signal voltage on your own mower.** This is not a universal pinout guarantee.
@@ -65,9 +91,13 @@ The following AUX1 connections were reported physically tested on the original A
 | 3 | GND |
 | 6 | **5 V supply** to the board's suitable 5 V input, subject to its power requirements |
 
-The owner confirmed **AUX1 pin 6 is 5 V**. Its current capacity and whether it remains powered during mower sleep have not been verified. Ensure the supply is stable and suitable for your board. ESP32-C3 GPIO pins must not receive 5 V. **Never connect AUX1 pin 7 (approximately 18 V) directly to the ESP32 board.** Disconnect power before wiring or servicing.
+The owner confirmed **AUX1 pin 6 is 5 V**. The owner reports that this 5 V supply switches off when the mower enters sleep. Its current capacity has not been quantified. Ensure the supply is stable and suitable for your board. ESP32-C3 GPIO pins must not receive 5 V. **Never connect AUX1 pin 7 (approximately 18 V) directly to the ESP32 board.** Disconnect power before wiring or servicing.
 
 UART: 115200 baud, 8 data bits, no parity, 1 stop bit.
+
+## Sleep limitation: no remote wake-up
+
+**When the mower goes to sleep, the 5 V supply on AUX1 pin 6 is lost. The ESP32 therefore powers off and cannot receive Wi-Fi, Home Assistant or UART commands. This setup cannot wake the mower from sleep.** This behavior was observed by the owner on this installation. Changing a polling interval or pressing START in Home Assistant cannot restore power to the ESP32.
 
 ## Features and behavior
 
@@ -76,8 +106,128 @@ UART: 115200 baud, 8 data bits, no parity, 1 stop bit.
 - AUTO/MAN/HOME selection, separate START/STOP, PIN authentication and manual clock synchronization.
 - No GPS, wake relay or automatic START on boot. **A mode change may still cause movement**, depending on mower firmware.
 - Clock synchronization writes the time only, not the date or schedules. It requires accepted PIN, valid Home Assistant time and fresh Parked/Charging status. The original configuration reports successful testing while charging and rejection while mowing.
-- After 60 seconds without a valid UART response, communication is marked lost. Existing readings may remain visible but are historical. Mower sleep or loss of ESP32 power can make the device unavailable in Home Assistant; this setup cannot wake an unpowered device.
+- After 60 seconds without a valid UART response, communication is marked lost. Existing readings may remain visible but are historical. When the mower enters sleep, AUX1 loses its 5 V supply and the ESP32 turns off, making the device unavailable in Home Assistant. **You cannot wake the mower from sleep through this integration**, because the ESP32 has no power. The mower must wake by its own supported means before the integration reconnects.
 - Automatic authentication requires a fresh response and is attempted once per session. If the PIN is rejected, check the configuration rather than repeatedly pressing Authenticate PIN. The mower's own lockout rules still apply.
+
+## Parameter and entity list
+
+The following list is taken from `automower-310.yaml`, including the controls, measurements and diagnostic entities it actually exposes. These are not all commands supported by the mower protocol. Wi-Fi, PIN and password settings are listed under **Set up everything in the ESPHome app** above.
+
+### Controls
+
+| Entity | Unit / meaning |
+| --- | --- |
+| Synchronize clock | Write time only; requires valid HA time, PIN, fresh contact and Parked/Charging status |
+| Authenticate PIN | Send the configured PIN; never shows the PIN value |
+| Stop mower | Send STOP; not a physical emergency stop |
+| Start mower | Send START; requires PIN, fresh contact and no competing mode/clock command |
+| Refresh status | Request a new operating-status response |
+
+### Mode selector
+
+| Entity | Unit / meaning |
+| --- | --- |
+| Select operating mode | AUTO / MAN / HOME; changing mode may cause movement |
+
+### Numeric sensors
+
+| Entity | Unit / meaning |
+| --- | --- |
+| Battery | % |
+| Battery voltage | V |
+| Battery current | mA |
+| Battery capacity | mAh |
+| Battery temperature | °C |
+| Operating hours | h |
+| Left wheel - power | % |
+| Left wheel - speed | rpm |
+| Left wheel - current | mA |
+| Right wheel - power | % |
+| Right wheel - speed | rpm |
+| Right wheel - current | mA |
+| Blade motor - speed | rpm |
+| Blade motor - current | mA |
+| Tilt X | ° |
+| Tilt Y | ° |
+| Tilt Z | ° |
+| WiFi signal | dBm |
+| ESP32 uptime | s |
+| UART CRC errors | count |
+| UART rejected responses | count |
+| Seconds since last valid response | s |
+| Seconds since last status | s |
+
+### Binary sensors
+
+| Entity | Unit / meaning |
+| --- | --- |
+| Mower communication | On / off |
+| Mower active | On / off |
+| Mower error | On / off |
+| Mower moving | On / off |
+| Blade motor active | On / off |
+| Collision sensor | On / off |
+| Lift sensor | On / off |
+| Abnormal position | On / off |
+
+### Text/status sensors
+
+| Entity | Unit / meaning |
+| --- | --- |
+| Operating status | Parked / Mowing / Returning / Charging / Searching / Error / Unknown / No connection |
+| Operating mode | Internal only; reflected by Select operating mode |
+| Error code (raw) | Raw error bytes, or None |
+| Error description | Decoded error description, or None |
+| PIN authentication | Authentication status only, never the secret PIN |
+| Last control command | Most recent command result or request |
+| Cover status | Open / Closed / Unknown |
+| Mower clock | HH:MM:SS |
+| Mower date | DD.MM.YYYY |
+| Next start (Unix time) | Unix timestamp as text, or Not scheduled |
+
+### Polling and publication intervals
+
+| Data group | Normal interval |
+| --- | --- |
+| Operating status/mode, wheel readings, blade motor readings | About 2 s |
+| Collision, lift and tilt | About 5 s |
+| Battery percentage, voltage/current and cover | About 10 s |
+| Battery capacity/temperature | Read about every 10 s; published at most every 30 s |
+| Operating hours, mower clock and next start | About 60 s |
+| Mower date | About 1 hour |
+| Wi-Fi signal / ESP32 uptime | 30 s / 60 s |
+| UART diagnostic counters and response/status age | 10 s |
+| Missing UART contact while ESP32 is still powered | Status request about every 5 s |
+
+Status-derived binary sensors update with the corresponding response. Text states are event-driven. Polling is paused during mode changes and clock synchronization. Intervals are approximate; valid responses are required. **An unpowered ESP32 does not poll at all.**
+
+### Serial command reference (RS232/UART)
+
+The serial parameter/command reference was found online, not invented by ChatGPT. The original configuration cites **Robomower V0.8**, by David Gross with Chris P. (ein-stein) and Andi291. See the [original PDF](https://www.mikrocontroller.net/attachment/278555/Robomower_V0.8.pdf) and [author's forum post](https://www.mikrocontroller.net/topic/304526#4403150).
+
+This table describes the subset used by this YAML. Page numbers refer to the PDF; START/STOP details also appear in [Andi291's follow-up](https://www.mikrocontroller.net/topic/304526#4403399).
+
+| Operation | Request opcode / payload | Reference |
+| --- | --- | --- |
+| Authenticate | `0C / 00 01 PIN-low PIN-high` | p. 6 |
+| Read clock / write clock | `02 / 00`; `02 / 80 HH MM SS` | p. 7 |
+| Read date | `02 / 01` | p. 8 |
+| HOME / MAN / AUTO | `0E / 02`, `03`, `04` | p. 32 |
+| STOP / START | `0E / 00`, `01` | Forum follow-up |
+| Next start | `06 / 05` | p. 34 |
+| Operating status | `12 / 01` | p. 35 |
+| Battery / wheels / blade | `14 / 01`, `02`, `03` | pp. 37–39 |
+| Collision/lift/tilt / cover | `14 / 04`, `05` | pp. 40–41 |
+
+Frames use `02`, opcode, payload length, payload, Dallas CRC8 and `03`; serial settings are 115200, 8N1. This is community reverse-engineering, not an official Husqvarna specification. The **AUX1 UART signal levels must be checked separately**: “RS232” is used here as a serial-reference search term, not permission to connect conventional positive/negative-voltage RS-232 directly to ESP32 GPIO. Use the owner-confirmed wiring above for this installation; the older PDF uses RX/TX labels from a different perspective.
+
+## Home Assistant examples
+
+These screenshots are from the owner's earlier **Norwegian-language configuration**. The configuration in this repository uses English entity names. The readings are examples, not reference values for your mower.
+
+<img src="docs/images/home-assistant-battery.png" alt="Home Assistant battery, status and tilt sensors from the earlier Norwegian configuration" width="420">
+
+<img src="docs/images/home-assistant-status.png" alt="Home Assistant mower status, motor readings and binary sensors from the earlier Norwegian configuration" width="420">
 
 ## Safety and secrets
 
@@ -99,7 +249,7 @@ All entity labels, status messages and comments are in English. When migrating f
 
 ## Credits and validation
 
-The original configuration credits Robomower V0.8, Wall-E v1.20 and diagnostic ideas from AMConnect. Source URLs and license records for those contributions were not supplied. No new license is assigned to the combined material here; verify provenance and applicable permissions before relicensing it.
+The original configuration credits Robomower V0.8, Wall-E v1.20 and diagnostic ideas from AMConnect. The Robomower protocol source is linked above. License records for the combined material have not been established. No new license is assigned here; verify applicable permissions before relicensing it. The ChatGPT-generated implementation uses community protocol research; authorship of that research belongs to its contributors.
 
 See [VALIDATION.md](VALIDATION.md) for checks and limitations.
 

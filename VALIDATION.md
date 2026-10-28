@@ -16,7 +16,7 @@ Validated on 2026-10-28 with ESPHome 2026.10.1, using disposable test credential
 ## Limitations
 
 - No firmware has been installed on a device and no physical mower test has been performed for this edition.
-- Original hardware observations are reported by the owner, not independently repeated here. AUX1 pin 6 is confirmed by the owner as 5 V; current capacity and sleep behavior remain unverified.
+- Original hardware observations are reported by the owner, not independently repeated here. AUX1 pin 6 is confirmed by the owner as 5 V; the owner also reports that this supply turns off during sleep, powering off the ESP32 and preventing remote wake-up. Current capacity remains unquantified.
 - ESPHome 2026.10.1 accepts the OTA password configuration but emits a recommendation to use OTA encryption instead to reduce flash/RAM use. API encryption remains configured separately.
 - The Windows build emitted long-path warnings while configuring the bootloader, but the complete build succeeded.
 

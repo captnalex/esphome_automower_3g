@@ -2,7 +2,8 @@
 # Original credits: Robomower V0.8, Wall-E v1.20 and AMConnect diagnostic ideas.
 # AUX1: pin 1 -> GPIO4 RX; pin 2 -> GPIO5 TX; pin 3 -> GND; pin 6 -> 5 V.
 # Verify connector orientation and signal levels on your mower before wiring.
-# Pin 6 current capacity and power during sleep are not verified.
+# Owner-observed: pin 6 loses 5 V during sleep, powering off the ESP32; no remote wake.
+# Pin 6 current capacity has not been quantified.
 # NEVER connect AUX1 pin 7 (approximately 18 V) directly to the ESP32 board.
 # No GPS, wake relay or automatic START on boot. A mode change may cause motion.
 # Manual clock sync only; parked/charging status, accepted PIN and HA time required.
