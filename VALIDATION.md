@@ -11,7 +11,7 @@ Full firmware compilation passed. RAM: 105,493 / 321,296 bytes (32.8%); flash: 8
 
 ## Limits
 
-No physical test of the new date writes, timer writes or persistent skip workflow has been performed here. Input tests and compilation do not test the full UART state machine, acknowledgement timing, flash persistence or mower motion. The earlier owner log confirmed PIN acceptance, normal readings, and timer responses on v3.9-test1, but did not confirm weekdays or next-start interpretation against the mower display.
+**Hardware tested by the owner on a Husqvarna Automower 310**, confirmed on 2026-10-29. This is owner-reported testing, in addition to the compilation and automated checks above. Other Gen3 models and firmware variants have not been tested.
 
 ## Repeat
 

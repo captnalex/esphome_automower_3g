@@ -1,6 +1,6 @@
 # Automower 310 v3.10-test1
 
-Experimental public version. Full hardware verification of the new write/skip features remains pending. All implementation code was generated with ChatGPT. Protocol research is credited below. The previous test showed PIN acceptance, sensor readings and timer replies on the owner's mower. That does not verify the new writes or weekday interpretation.
+**Tested by the owner on a Husqvarna Automower 310**, confirmed on 2026-10-29. All implementation code was generated with ChatGPT. Protocol research is credited below. Other Gen3 models have not been tested.
 
 ## Install in ESPHome Device Builder
 
@@ -14,7 +14,7 @@ Press **Synchronize date and clock** while parked or charging, with accepted PIN
 
 ## Editing a timer
 
-First compare the existing timer times and weekday labels with the mower display. The observed replies currently show Monday for Timer 1 and different weekdays for the two disabled Timer 2 endpoints; these interpretations still require physical confirmation. The **Next start (local time)** reading also needs comparison with the mower display. Do not compensate for an unverified decoder by changing the mower schedule.
+When installing on another mower, compare timer times, weekdays and next-start readings with its display before changing the schedule.
 
 1. Park the mower and wait for fresh timer readings (up to 90 seconds).
 2. Turn on **Allow experimental timer changes**. It resets to off after a reboot.
@@ -45,7 +45,7 @@ The ESP32 blocks ordinary START/mode selections during a skip hold or pending au
 2. Synchronize date/clock while parked. Check both physical date/time and the result message.
 3. Load an endpoint and first Apply its unchanged values. Confirm the readback and display before testing a changed time/day. Save your original schedule before editing.
 4. Test Skip while parked in AUTO, confirm HOME, then Cancel and confirm AUTO with the area clear. Test STOP during a skip to verify automatic resumption is cancelled.
-5. Verify skip persistence/recovery and next-day behavior before depending on it unattended. The new code has not been tested physically here.
+5. Verify skip persistence/recovery and next-day behavior before depending on it unattended.
 
 ## Sources
 

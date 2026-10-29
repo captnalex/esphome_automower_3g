@@ -1,4 +1,4 @@
-# Husqvarna Automower 310 / ESP32-C3 Super Mini - ESPHome v3.10-test1, NOT hardware tested
+# Husqvarna Automower 310 / ESP32-C3 Super Mini - ESPHome v3.10-test1, owner-tested on Automower 310 (2026-10-29)
 # Original credits: Robomower V0.8, Wall-E v1.20 and AMConnect diagnostic ideas.
 # AUX1: pin 1 -> GPIO4 RX; pin 2 -> GPIO5 TX; pin 3 -> GND; pin 6 -> 5 V.
 # Verify connector orientation and signal levels on your mower before wiring.

@@ -8,9 +8,9 @@ The repository name refers to Generation 3. Compatibility with every Gen3 model 
 
 ## Latest update: v3.10-test1
 
-This experimental update adds timer endpoint editing, persistent **Skip mowing today**, and combined date/clock synchronization, all running on the ESP32. It also includes the v3.9 timer readings, readable next-start time and improved command acknowledgements. No rain automation is included; this can be added in Home Assistant later.
+This update adds timer endpoint editing, persistent **Skip mowing today**, and combined date/clock synchronization, all running on the ESP32. It also includes the v3.9 timer readings, readable next-start time and improved command acknowledgements. No rain automation is included; this can be added in Home Assistant later.
 
-**Test status:** the owner reports that the original Norwegian version works very well. Logs from the English v3.9 test confirm PIN acceptance, normal sensor readings and timer responses. The v3.10 source passes full compilation and input-validation tests, but complete physical verification of the new writes and next-day skip behavior remains pending. Compare weekday and next-start readings with the mower display before relying on them. Other Gen3 models may work but have not been tested.
+**Test status: tested by the owner on a Husqvarna Automower 310.** The owner confirmed testing of this version on 2026-10-29. The original Norwegian version also worked very well. Full compilation and input-validation tests passed. Other Gen3 models may work but have not been tested.
 
 See [CHANGELOG.md](CHANGELOG.md), [TESTING.md](TESTING.md) for operation and testing, and [VALIDATION.md](VALIDATION.md) for exact checks.
 

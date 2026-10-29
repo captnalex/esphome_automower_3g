@@ -1,6 +1,6 @@
 # Changelog
 
-## v3.10-test1 - experimental public update (2026-10-29)
+## v3.10-test1 - public update (2026-10-29)
 
 - Add guarded timer endpoint editing: select, load, edit time/weekdays, explicitly apply, and verify by readback. Editing defaults off after reboot.
 - Add persistent Skip mowing today and cancellation, using HOME without changing the saved schedule. Restore AUTO next local day/next wake only when previously in AUTO. STOP cancels automatic resumption.
@@ -9,7 +9,7 @@
 - Include 17 compile-time C++ input-parser tests. Full firmware compilation passes with ESPHome 2026.10.1.
 - Keep all credentials in Secrets in the public YAML. No rain automation or wake hardware was added.
 
-New writes, skip persistence and next-day behavior still require physical verification. The owner approved publication; this is not a declaration of complete hardware validation.
+The owner confirmed on 2026-10-29 that this version has been tested on their Husqvarna Automower 310. Other Gen3 models have not been tested.
 
 ## v3.9-test1 - included changes
 
