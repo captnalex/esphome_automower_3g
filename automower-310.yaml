@@ -1,4 +1,4 @@
-# Husqvarna Automower 310 / ESP32-C3 Super Mini - ESPHome v3.8, shareable edition
+# Husqvarna Automower 310 / ESP32-C3 Super Mini - ESPHome v3.10-test1, NOT hardware tested
 # Original credits: Robomower V0.8, Wall-E v1.20 and AMConnect diagnostic ideas.
 # AUX1: pin 1 -> GPIO4 RX; pin 2 -> GPIO5 TX; pin 3 -> GND; pin 6 -> 5 V.
 # Verify connector orientation and signal levels on your mower before wiring.
@@ -6,9 +6,10 @@
 # Pin 6 current capacity has not been quantified.
 # NEVER connect AUX1 pin 7 (approximately 18 V) directly to the ESP32 board.
 # No GPS, wake relay or automatic START on boot. A mode change may cause motion.
-# Manual clock sync only; parked/charging status, accepted PIN and HA time required.
+# Manual date/clock sync; parked/charging status, accepted PIN and HA time required.
 # Original testing confirmed clock writes while charging, not while mowing.
 # One polling slot per 200 ms: status, wheels and blade every 2 seconds.
+# Timer endpoints polled every 60 seconds. Explicit, guarded endpoint editing.
 # Other groups: sensors 5 s; battery/cover 10 s; clock/next start 60 s; date 1 hour.
 # After loss of communication: status polling every 5 seconds; no wake capability.
 # Old measurements are historical when the connection is lost.
@@ -130,10 +131,19 @@ uart:
               id(pin_accepted) = (response == 0);
               id(pin_status).publish_state(id(pin_accepted) ? "Accepted" : "Rejected");
             }
-            if (command == 0x0F && data_length >= 1 && id(waiting_for_mode)) {
-              id(mode_acknowledged) = (response == 0);
-              id(mode_response_ready) = true;
-              id(waiting_for_mode) = false;
+            if (command == 0x0F && data_length == 1 && id(pending_control) != 255 &&
+                !id(control_ack_ambiguous)) {
+              id(control_acknowledged) = (response == 0);
+              if (response != 0) {
+                char message[96];
+                snprintf(message, sizeof(message), "%s rejected (0x%02X)",
+                         id(control_label).c_str(), unsigned(response));
+                id(last_control_command).publish_state(message);
+                id(pending_control) = 255;
+              } else {
+                id(last_control_command).publish_state(
+                    id(control_label) + " acknowledged; waiting for status");
+              }
             }
             if (command == 0x03 && id(clock_sync_pending)) {
               if (response != 0) {
@@ -157,6 +167,7 @@ uart:
                   id(clock_sync_pending) = false;
                   id(clock_sync_readback_sent) = false;
                   if (difference <= 8) {
+                    id(clock_sync_success) = true;
                     id(last_control_command).publish_state("Clock sync confirmed");
                     ESP_LOGI("automower", "Clock sync confirmed by readback (difference %d s)", difference);
                   } else {
@@ -169,6 +180,10 @@ uart:
               }
             }
 
+            if (response != 0 && command == 0x07 && id(apply_timer).is_running())
+              id(write_failed) = true;
+            if (response != 0 && command == 0x03 && id(synchronize_date_time).is_running())
+              id(date_failed) = true;
             if (response != 0) {
               id(rejected_response_count)++;
               ESP_LOGW("automower", "Rejected response 0x%02X, status 0x%02X", command, response);
@@ -218,6 +233,27 @@ uart:
                   id(blade_motor_active).publish_state(receive_buffer[5] == 0x01);
                 } else {
                   id(blade_motor_active).publish_state(false);
+                }
+              }
+              if (id(pending_control) != 255 && id(control_acknowledged) &&
+                  (uint32_t)(now_ms - id(control_sent_ms)) >= 300) {
+                const uint8_t requested = id(pending_control);
+                bool observed = false;
+                if (requested == 1) observed = operating_state == 2;
+                else if (requested == 0)
+                  observed = operating_state == 1 || operating_state == 4 || operating_state == 7;
+                else if (data_length >= 5) {
+                  const char *expected = requested == 2 ? "HOME" : (requested == 3 ? "MAN" : "AUTO");
+                  observed = id(operating_mode).state == expected;
+                }
+                if (observed) {
+                  std::string result = id(control_label) + " acknowledged; ";
+                  if (requested == 0)
+                    result += std::string("status: ") + text + " (verify physical stop)";
+                  else if (requested == 1) result += "Mowing status observed";
+                  else result += "mode observed in status (not a motion confirmation)";
+                  id(last_control_command).publish_state(result);
+                  id(pending_control) = 255;
                 }
               }
               if (data_length >= 19) {
@@ -329,10 +365,51 @@ uart:
                 receive_buffer[7] >= 1 && receive_buffer[7] <= 31) {
               const unsigned year = uint16_t(receive_buffer[4]) |
                                    (uint16_t(receive_buffer[5]) << 8);
+              id(date_values) = {uint16_t(year), receive_buffer[6], receive_buffer[7], receive_buffer[8]};
+              id(date_revision)++;
               char date[20];
               snprintf(date, sizeof(date), "%02u.%02u.%04u",
                        receive_buffer[7], receive_buffer[6], year);
               id(mower_date).publish_state(date);
+            }
+            // Robomower V0.8 pp. 22-25, 30-31. Byte 4 identifies the endpoint.
+            // Preserve 24:00 (documented disabled endpoint), reject unknown layouts.
+            if (command == 0x07 && data_length == 9) {
+              const uint8_t endpoint = receive_buffer[4];
+              const unsigned hour = unsigned(receive_buffer[5]) |
+                                    (unsigned(receive_buffer[6]) << 8);
+              const unsigned minute = receive_buffer[7];
+              const uint8_t days = receive_buffer[8];
+              const uint8_t enabled = receive_buffer[11];
+              if ((endpoint == 1 || endpoint == 0x81 || endpoint == 2 || endpoint == 0x82) &&
+                  hour <= 24 && minute <= 59 && (hour != 24 || minute == 0) &&
+                  (days & 0x80) == 0 && enabled <= 1) {
+                const int index = (endpoint & 0x7F) - 1 + ((endpoint & 0x80) ? 2 : 0);
+                for (int j = 0; j < 7; j++) id(timer_cache)[index][j] = receive_buffer[5 + j];
+                id(timer_seen)[index] = now_ms;
+                id(timer_revision)[index]++;
+                char hhmm[8];
+                snprintf(hhmm, sizeof(hhmm), "%02u:%02u", hour, minute);
+                std::string value = hhmm;
+                value += " | ";
+                const char *names[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+                bool first = true;
+                for (unsigned day = 0; day < 7; day++) {
+                  if (days & (1U << day)) {
+                    if (!first) value += ", ";
+                    value += names[day];
+                    first = false;
+                  }
+                }
+                if (first) value += "No days";
+                value += enabled ? " | Enabled" : " | Disabled";
+                if (endpoint == 1) id(timer_1_start).publish_state(value);
+                else if (endpoint == 0x81) id(timer_1_end).publish_state(value);
+                else if (endpoint == 2) id(timer_2_start).publish_state(value);
+                else id(timer_2_end).publish_state(value);
+              } else {
+                ESP_LOGW("automower", "Unsupported timer response; no schedule published");
+              }
             }
             if (command == 0x07 && data_length == 10) {
               uint32_t epoch = uint32_t(receive_buffer[9]) |
@@ -341,10 +418,14 @@ uart:
                                (uint32_t(receive_buffer[12]) << 24);
               if (epoch == 0) {
                 id(next_start_unix).publish_state("Not scheduled");
+                id(next_start_local).publish_state("Not scheduled");
               } else {
                 char timestamp[16];
                 snprintf(timestamp, sizeof(timestamp), "%lu", (unsigned long)epoch);
                 id(next_start_unix).publish_state(timestamp);
+                // Explicit local date/time with offset, using the configured HA time zone.
+                auto local = ESPTime::from_epoch_local(epoch);
+                id(next_start_local).publish_state(local.strftime("%Y-%m-%d %H:%M:%S %z"));
               }
             }
 
@@ -353,6 +434,114 @@ uart:
           if (receive_buffer.size() > 512) receive_buffer.clear();
 
 globals:
+  - id: skip_suspended
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  - id: timer_cache
+    type: 'std::array<std::array<uint8_t, 7>, 4>'
+    restore_value: no
+    initial_value: 'std::array<std::array<uint8_t, 7>, 4>{}'
+  - id: timer_seen
+    type: 'std::array<uint32_t, 4>'
+    restore_value: no
+    initial_value: 'std::array<uint32_t, 4>{}'
+  - id: timer_revision
+    type: 'std::array<uint32_t, 4>'
+    restore_value: no
+    initial_value: 'std::array<uint32_t, 4>{}'
+  - id: loaded_endpoint
+    type: 'int'
+    restore_value: no
+    initial_value: '-1'
+  - id: loaded_timer
+    type: 'std::array<uint8_t, 7>'
+    restore_value: no
+    initial_value: 'std::array<uint8_t, 7>{}'
+  - id: write_endpoint
+    type: 'int'
+    restore_value: no
+    initial_value: '-1'
+  - id: write_hour
+    type: 'uint8_t'
+    restore_value: no
+    initial_value: '0'
+  - id: write_minute
+    type: 'uint8_t'
+    restore_value: no
+    initial_value: '0'
+  - id: write_days
+    type: 'uint8_t'
+    restore_value: no
+    initial_value: '0'
+  - id: write_revision
+    type: 'uint32_t'
+    restore_value: no
+    initial_value: '0'
+  - id: write_failed
+    type: 'bool'
+    restore_value: no
+    initial_value: 'false'
+  - id: date_values
+    type: 'std::array<uint16_t, 4>'
+    restore_value: no
+    initial_value: 'std::array<uint16_t, 4>{}'
+  - id: date_revision
+    type: 'uint32_t'
+    restore_value: no
+    initial_value: '0'
+  - id: date_baseline
+    type: 'uint32_t'
+    restore_value: no
+    initial_value: '0'
+  - id: date_failed
+    type: 'bool'
+    restore_value: no
+    initial_value: 'false'
+  - id: sync_date_target
+    type: 'std::array<uint16_t, 4>'
+    restore_value: no
+    initial_value: 'std::array<uint16_t, 4>{}'
+  - id: clock_sync_success
+    type: 'bool'
+    restore_value: no
+    initial_value: 'false'
+  - id: skip_day
+    type: 'uint32_t'
+    restore_value: yes
+    initial_value: '0'
+  - id: skip_restore_auto
+    type: 'bool'
+    restore_value: yes
+    initial_value: 'false'
+  - id: skip_last_attempt
+    type: 'uint32_t'
+    restore_value: no
+    initial_value: '0'
+  - id: skip_release
+    type: 'bool'
+    restore_value: yes
+    initial_value: 'false'
+  - id: pending_control
+    type: uint8_t
+    restore_value: no
+    initial_value: '255'
+  - id: control_sent_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  - id: control_acknowledged
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: control_ack_ambiguous
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: control_label
+    type: std::string
+    restore_value: no
+    initial_value: '"None"'
   - id: last_response_ms
     type: uint32_t
     restore_value: no
@@ -374,18 +563,6 @@ globals:
     restore_value: no
     initial_value: 'false'
   - id: pin_requested
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: waiting_for_mode
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: mode_acknowledged
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: mode_response_ready
     type: bool
     restore_value: no
     initial_value: 'false'
@@ -415,6 +592,34 @@ globals:
     initial_value: '0'
 
 text_sensor:
+  - platform: template
+    name: "Schedule edit result"
+    id: schedule_result
+    update_interval: never
+  - platform: template
+    name: "Skip today status"
+    id: skip_status
+    update_interval: never
+  - platform: template
+    update_interval: never
+    name: "Next start (local time)"
+    id: next_start_local
+  - platform: template
+    update_interval: never
+    name: "Timer 1 start"
+    id: timer_1_start
+  - platform: template
+    update_interval: never
+    name: "Timer 1 end"
+    id: timer_1_end
+  - platform: template
+    update_interval: never
+    name: "Timer 2 start"
+    id: timer_2_start
+  - platform: template
+    update_interval: never
+    name: "Timer 2 end"
+    id: timer_2_end
   - platform: template
     update_interval: never
     name: "Operating status"
@@ -640,6 +845,207 @@ binary_sensor:
     device_class: problem
 
 script:
+  - id: persist_skip_state
+    mode: single
+    then:
+      - lambda: |-
+          // Flush restoring-global components before syncing NVS. ESPHome's
+          // id(...) shorthand accesses the value, so component pointers are used here.
+          skip_day->update();
+          skip_restore_auto->update();
+          skip_release->update();
+          skip_suspended->update();
+          global_preferences->sync();
+  - id: synchronize_date_time
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(pin_accepted) && id(last_status_ms) != 0 &&
+              (uint32_t)(millis() - id(last_status_ms)) < 15000 &&
+              (id(operating_status).state == "Parked" || id(operating_status).state == "Charging") &&
+              id(pending_control) == 255 && id(ha_time).now().is_valid() && !id(apply_timer).is_running();
+          then:
+            - lambda: |-
+                id(date_failed) = false;
+                id(clock_sync_success) = false;
+                id(date_baseline) = id(date_revision);
+            - delay: 500ms
+            - uart.write:
+                id: mower_uart
+                data: [0x02,0x02,0x01,0x01,0xD5,0x03]
+            - wait_until:
+                condition:
+                  lambda: 'return id(date_revision) != id(date_baseline) || id(date_failed);'
+                timeout: 5s
+            - if:
+                condition:
+                  lambda: 'return !id(date_failed) && id(date_revision) != id(date_baseline) && id(ha_time).now().is_valid();'
+                then:
+                  - lambda: |-
+                      auto now = id(ha_time).now();
+                      // Preserve the mower's existing date/time display-format byte.
+                      id(sync_date_target) = {uint16_t(now.year), now.month, now.day_of_month, id(date_values)[3]};
+                      std::vector<uint8_t> telegram = {0x02,0x02,0x06,0x81,
+                        uint8_t(now.year), uint8_t(now.year >> 8), now.month, now.day_of_month,
+                        uint8_t(id(date_values)[3]),0,0x03};
+                      uint8_t crc = 0;
+                      for (size_t i = 1; i < telegram.size() - 2; i++) {
+                        uint8_t value = telegram[i];
+                        for (int bit = 0; bit < 8; bit++) {
+                          const bool mix = (crc ^ value) & 1;
+                          crc >>= 1;
+                          if (mix) crc ^= 0x8C;
+                          value >>= 1;
+                        }
+                      }
+                      telegram[telegram.size() - 2] = crc;
+                      id(mower_uart).write_array(telegram.data(), telegram.size());
+                      id(last_control_command).publish_state("Date sent; waiting for readback");
+                  - delay: 2s
+                  - lambda: 'id(date_baseline) = id(date_revision);'
+                  - uart.write:
+                      id: mower_uart
+                      data: [0x02,0x02,0x01,0x01,0xD5,0x03]
+                  - wait_until:
+                      condition:
+                        lambda: 'return id(date_revision) != id(date_baseline) || id(date_failed);'
+                      timeout: 5s
+                  - if:
+                      condition:
+                        lambda: 'return !id(date_failed) && id(date_revision) != id(date_baseline) && id(date_values) == id(sync_date_target);'
+                      then:
+                        - script.execute: synchronize_clock
+                        - script.wait: synchronize_clock
+                        - lambda: |-
+                            const auto now = id(ha_time).now();
+                            const bool same_day = now.is_valid() && now.year == id(sync_date_target)[0] &&
+                                now.month == id(sync_date_target)[1] && now.day_of_month == id(sync_date_target)[2];
+                            id(last_control_command).publish_state(id(clock_sync_success) && same_day ?
+                                "Date and clock confirmed by readback" :
+                                "Date confirmed; clock/day not confirmed - retry when parked");
+                      else:
+                        - text_sensor.template.publish:
+                            id: last_control_command
+                            state: "Date write not confirmed; clock not changed"
+                else:
+                  - text_sensor.template.publish:
+                      id: last_control_command
+                      state: "Date read failed; no settings written"
+          else:
+            - text_sensor.template.publish:
+                id: last_control_command
+                state: "Date/clock sync requires parked/charging, PIN, fresh status and HA time"
+
+  - id: apply_timer
+    mode: single
+    then:
+      - lambda: |-
+          id(write_endpoint) = -1;
+          const int index = id(loaded_endpoint);
+          if (!id(allow_timer_changes).state || !(
+          id(pin_accepted) && id(last_status_ms) != 0 &&
+          (uint32_t)(millis() - id(last_status_ms)) < 15000 &&
+          (id(operating_status).state == "Parked" || id(operating_status).state == "Charging") &&
+          id(pending_control) == 255
+              ) || id(synchronize_date_time).is_running() || id(synchronize_clock).is_running() ||
+              index < 0 || id(timer_endpoint).active_index().value_or(99) != index ||
+              id(timer_seen)[index] == 0 || (uint32_t)(millis() - id(timer_seen)[index]) > 90000 ||
+              id(timer_cache)[index] != id(loaded_timer)) {
+            id(schedule_result).publish_state("Blocked: enable editing, park mower and load a fresh endpoint");
+            return;
+          }
+          const std::string time = id(timer_draft_time).state;
+          const std::string days = id(timer_draft_days).state;
+          if (time.size() != 5 || time[2] != ':' ||
+              time[0] < '0' || time[0] > '9' || time[1] < '0' || time[1] > '9' ||
+              time[3] < '0' || time[3] > '9' || time[4] < '0' || time[4] > '9') {
+            id(schedule_result).publish_state("Invalid time: use HH:MM (24:00 disables this endpoint)"); return;
+          }
+          const int hour = (time[0]-'0')*10 + time[1]-'0';
+          const int minute = (time[3]-'0')*10 + time[4]-'0';
+          if (hour > 24 || minute > 59 || (hour == 24 && minute != 0)) {
+            id(schedule_result).publish_state("Invalid time range"); return;
+          }
+          const char *names[] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+          uint8_t mask = 0;
+          size_t pos = 0;
+          while (pos < days.size()) {
+            size_t end = pos;
+            while (end < days.size() && days[end] != ',') end++;
+            const bool last = end == days.size();
+            const std::string token = days.substr(pos, end-pos);
+            int day = -1;
+            for (int j=0; j<7; j++) if (token == names[j]) day = j;
+            if (day < 0 || (mask & (1U << day)) || (!last && end+1 == days.size())) {
+              id(schedule_result).publish_state("Use unique Mon,Tue,Wed,Thu,Fri,Sat,Sun without spaces; empty means no days"); return;
+            }
+            mask |= 1U << day;
+            if (last) break;
+            pos = end + 1;
+          }
+          id(write_endpoint) = index;
+          id(write_hour) = hour; id(write_minute) = minute; id(write_days) = mask;
+          id(write_failed) = false;
+      - if:
+          condition:
+            lambda: 'return id(write_endpoint) >= 0;'
+          then:
+            - delay: 500ms
+            - lambda: |-
+                const int index = id(write_endpoint);
+                const uint8_t endpoint = (index % 2 + 1) | (index >= 2 ? 0x80 : 0);
+                // Documented write layout, including A0 05; do not reuse opaque read-only bytes.
+                std::vector<uint8_t> telegram = {0x02,0x06,0x08,0x02,endpoint,
+                  id(write_hour),0,id(write_minute),id(write_days),0xA0,0x05,0,0x03};
+                uint8_t crc = 0;
+                for (size_t i = 1; i < telegram.size() - 2; i++) {
+                  uint8_t value = telegram[i];
+                  for (int bit = 0; bit < 8; bit++) {
+                    const bool mix = (crc ^ value) & 1;
+                    crc >>= 1;
+                    if (mix) crc ^= 0x8C;
+                    value >>= 1;
+                  }
+                }
+                telegram[telegram.size() - 2] = crc;
+                id(mower_uart).write_array(telegram.data(), telegram.size());
+                id(schedule_result).publish_state("Timer write sent; waiting for readback");
+            - delay: 2s
+            - lambda: |-
+                const int index = id(write_endpoint);
+                id(write_revision) = id(timer_revision)[index];
+                const uint8_t endpoint = (index % 2 + 1) | (index >= 2 ? 0x80 : 0);
+                std::vector<uint8_t> telegram = {0x02,0x06,0x02,0x01,endpoint,0,0x03};
+                uint8_t crc = 0;
+                for (size_t i = 1; i < telegram.size() - 2; i++) {
+                  uint8_t value = telegram[i];
+                  for (int bit = 0; bit < 8; bit++) {
+                    const bool mix = (crc ^ value) & 1;
+                    crc >>= 1;
+                    if (mix) crc ^= 0x8C;
+                    value >>= 1;
+                  }
+                }
+                telegram[telegram.size() - 2] = crc;
+                id(mower_uart).write_array(telegram.data(), telegram.size());
+            - wait_until:
+                condition:
+                  lambda: 'return id(write_failed) || id(timer_revision)[id(write_endpoint)] != id(write_revision);'
+                timeout: 5s
+            - lambda: |-
+                const int index = id(write_endpoint);
+                const auto &value = id(timer_cache)[index];
+                const bool matched = !id(write_failed) && id(timer_revision)[index] != id(write_revision) &&
+                    value[0] == id(write_hour) && value[1] == 0 && value[2] == id(write_minute) &&
+                    value[3] == id(write_days) && (id(write_hour) != 24 || value[6] == 0);
+                id(schedule_result).publish_state(matched ?
+                    "Endpoint confirmed by readback; check enabled state and both endpoints on mower" :
+                    "Write NOT confirmed; may have applied - inspect mower before retrying");
+                id(loaded_endpoint) = -1;
+                id(write_endpoint) = -1;
+
   - id: synchronize_clock
     mode: single
     then:
@@ -654,9 +1060,10 @@ script:
                      (uint32_t)(millis() - id(last_status_ms)) < 30000 &&
                      (id(operating_status).state == "Charging" ||
                       id(operating_status).state == "Parked") &&
-                     !id(change_mode).is_running();
+                     !id(change_mode).is_running() && id(pending_control) == 255;
           then:
             - lambda: |-
+                id(clock_sync_success) = false;
                 auto now_ms = id(ha_time).now();
                 if (now_ms.hour > 23 || now_ms.minute > 59 || now_ms.second > 59) {
                   ESP_LOGE("automower", "Invalid time from Home Assistant");
@@ -745,65 +1152,60 @@ script:
           telegram[7] = crc;
           id(mower_uart).write_array(telegram, sizeof(telegram));
 
-  # A mode command does not send a separate START command.
+  # Only one outstanding control command. The protocol has no transaction IDs.
+  - id: send_control
+    mode: single
+    parameters:
+      command: int
+    then:
+      - lambda: |-
+          if (command < 0 || command > 4) return;
+          const uint32_t now_ms = millis();
+          if (command != 0 && (id(pending_control) != 255 ||
+              (id(control_sent_ms) != 0 && (uint32_t)(now_ms - id(control_sent_ms)) < 5000))) {
+            id(last_control_command).publish_state("Control blocked (busy/cooldown)");
+            return;
+          }
+          // STOP remains available. If it interrupts a recent command, its ACK
+          // cannot be distinguished from the old ACK: never claim confirmation.
+          id(control_ack_ambiguous) = command == 0 &&
+              (id(pending_control) != 255 || (id(control_sent_ms) != 0 &&
+               (uint32_t)(now_ms - id(control_sent_ms)) < 5000));
+          id(pending_control) = command;
+          id(control_sent_ms) = now_ms;
+          id(control_acknowledged) = false;
+          const char *labels[] = {"STOP", "START", "HOME", "MAN", "AUTO"};
+          id(control_label) = labels[command];
+          static const uint8_t frames[5][6] = {
+            {0x02,0x0E,0x01,0x00,0x30,0x03},
+            {0x02,0x0E,0x01,0x01,0x6E,0x03},
+            {0x02,0x0E,0x01,0x02,0x8C,0x03},
+            {0x02,0x0E,0x01,0x03,0xD2,0x03},
+            {0x02,0x0E,0x01,0x04,0x51,0x03}
+          };
+          id(mower_uart).write_array(frames[command], 6);
+          id(last_control_command).publish_state(id(control_label) + " sent; waiting for acknowledgement");
+
   - id: change_mode
     mode: single
     parameters:
       mode: int
     then:
-      - if:
-          condition:
-            lambda: |-
-              return id(pin_accepted) &&
-                     !id(synchronize_clock).is_running() &&
-                     id(last_response_ms) != 0 &&
-                     (uint32_t)(millis() - id(last_response_ms)) < 30000;
-          then:
-            - lambda: |-
-                id(mode_response_ready) = false;
-                id(mode_acknowledged) = false;
-                id(waiting_for_mode) = true;
-                const uint8_t home[]  = {0x02,0x0E,0x01,0x02,0x8C,0x03};
-                const uint8_t man[]   = {0x02,0x0E,0x01,0x03,0xD2,0x03};
-                const uint8_t auto_[] = {0x02,0x0E,0x01,0x04,0x51,0x03};
-                if (mode == 2) id(mower_uart).write_array(home, sizeof(home));
-                else if (mode == 3) id(mower_uart).write_array(man, sizeof(man));
-                else if (mode == 4) id(mower_uart).write_array(auto_, sizeof(auto_));
-                else id(waiting_for_mode) = false;
-            - wait_until:
-                condition:
-                  lambda: 'return id(mode_response_ready);'
-                timeout: 5s
-            - if:
-                condition:
-                  lambda: 'return id(mode_response_ready) && id(mode_acknowledged);'
-                then:
-                  - lambda: |-
-                      const char *name = mode == 2 ? "HOME" : (mode == 3 ? "MAN" : "AUTO");
-                      char text[64];
-                      snprintf(text, sizeof(text), "Mode %s confirmed (no START sent)", name);
-                      id(last_control_command).publish_state(text);
-                      ESP_LOGI("automower", "Mode command %s confirmed; no separate START sent", name);
-                else:
-                  - text_sensor.template.publish:
-                      id: last_control_command
-                      state: "Mode not confirmed"
-                  - logger.log:
-                      level: WARN
-                      format: "Mode not confirmed: rejected or no acknowledgement"
-            - lambda: 'id(waiting_for_mode) = false;'
-            - uart.write:
-                id: mower_uart
-                data: [0x02, 0x12, 0x01, 0x01, 0x9F, 0x03]
-          else:
-            - text_sensor.template.publish:
-                id: last_control_command
-                state: "Mode blocked (PIN/connection)"
-            - logger.log:
-                level: WARN
-                format: "Mode change blocked: PIN or AUX connection missing"
+      - script.execute:
+          id: send_control
+          command: !lambda 'return mode;'
 
 select:
+  - platform: template
+    name: "Timer endpoint to edit"
+    id: timer_endpoint
+    optimistic: true
+    initial_option: "Timer 1 start"
+    options:
+      - "Timer 1 start"
+      - "Timer 2 start"
+      - "Timer 1 end"
+      - "Timer 2 end"
   - platform: template
     name: "Select operating mode"
     id: select_operating_mode
@@ -822,6 +1224,9 @@ select:
           if (!id(pin_accepted) ||
               id(last_response_ms) == 0 ||
               (uint32_t)(millis() - id(last_response_ms)) >= 30000 ||
+              id(skip_day) != 0 || id(skip_release) ||
+              id(apply_timer).is_running() || id(synchronize_date_time).is_running() ||
+              id(pending_control) != 255 ||
               id(change_mode).is_running() ||
               id(synchronize_clock).is_running()) {
             id(last_control_command).publish_state("Mode blocked (PIN/connection/busy)");
@@ -836,10 +1241,65 @@ select:
 
 button:
   - platform: template
-    name: "Synchronize clock"
+    name: "Load timer for editing"
+    on_press:
+      - lambda: |-
+          if (id(apply_timer).is_running()) return;
+          const int index = id(timer_endpoint).active_index().value_or(99);
+          if (index > 3 || id(timer_seen)[index] == 0 ||
+              (uint32_t)(millis() - id(timer_seen)[index]) > 90000) {
+            id(loaded_endpoint) = -1;
+            id(schedule_result).publish_state("No fresh timer reading; wait for polling while mower is awake"); return;
+          }
+          id(loaded_endpoint) = index;
+          id(loaded_timer) = id(timer_cache)[index];
+          char time[8];
+          snprintf(time, sizeof(time), "%02u:%02u", id(loaded_timer)[0], id(loaded_timer)[2]);
+          id(timer_draft_time).publish_state(time);
+          std::string days;
+          const char *names[] = {"Mon","Tue","Wed","Thu","Fri","Sat","Sun"};
+          for (int j=0; j<7; j++) if (id(loaded_timer)[3] & (1U << j)) {
+            if (!days.empty()) days += ",";
+            days += names[j];
+          }
+          id(timer_draft_days).publish_state(days);
+          id(schedule_result).publish_state("Draft loaded; edit then Apply (one endpoint only)");
+  - platform: template
+    name: "Apply timer endpoint"
+    on_press:
+      - script.execute: apply_timer
+  - platform: template
+    name: "Skip mowing today"
+    on_press:
+      - lambda: |-
+          const auto now = id(ha_time).now();
+          if (!now.is_valid() || !id(pin_accepted) || id(last_status_ms) == 0 ||
+              (uint32_t)(millis() - id(last_status_ms)) >= 15000) {
+            id(skip_status).publish_state("Skip blocked: requires valid HA time, PIN and fresh mower status"); return;
+          }
+          if (id(skip_day) == 0 && !id(skip_release))
+            id(skip_restore_auto) = id(operating_mode).state == "AUTO";
+          id(skip_day) = now.year * 10000UL + now.month * 100UL + now.day_of_month;
+          id(skip_suspended) = false;
+          id(skip_release) = false;
+          id(skip_last_attempt) = 0;
+          id(skip_status).publish_state("Skip requested; waiting to confirm HOME mode");
+          id(persist_skip_state).execute();
+  - platform: template
+    name: "Cancel skip today"
+    on_press:
+      - lambda: |-
+          if (id(skip_day) == 0) return;
+          id(skip_day) = 0;
+          id(skip_release) = id(skip_restore_auto);
+          id(skip_last_attempt) = 0;
+          id(skip_status).publish_state(id(skip_release) ? "Cancel requested; waiting to restore AUTO" : "Skip cancelled; mode left unchanged");
+          id(persist_skip_state).execute();
+  - platform: template
+    name: "Synchronize date and clock"
     icon: mdi:clock-sync
     on_press:
-      - script.execute: synchronize_clock
+      - script.execute: synchronize_date_time
   - platform: template
     name: "Authenticate PIN"
     on_press:
@@ -849,33 +1309,35 @@ button:
     on_press:
       - script.stop: change_mode
       - script.stop: synchronize_clock
+      - script.stop: synchronize_date_time
+      - script.stop: apply_timer
       - lambda: |-
-          id(waiting_for_mode) = false;
+          id(skip_restore_auto) = false;
+          id(skip_release) = false;
+          id(skip_suspended) = true;
+          id(persist_skip_state).execute();
+          id(loaded_endpoint) = -1;
+          id(schedule_result).publish_state("Interrupted by STOP; read mower settings before retrying");
+      - lambda: |-
           id(clock_sync_pending) = false;
           id(clock_sync_readback_sent) = false;
-      - text_sensor.template.publish:
-          id: last_control_command
-          state: "STOP requested"
-      - uart.write:
-          id: mower_uart
-          data: [0x02, 0x0E, 0x01, 0x00, 0x30, 0x03]
+      - script.execute:
+          id: send_control
+          command: 0
   - platform: template
     name: "Start mower"
     on_press:
       - if:
           condition:
-            lambda: 'return id(pin_accepted) && !id(change_mode).is_running() && !id(synchronize_clock).is_running() && id(last_response_ms) != 0 && (uint32_t)(millis() - id(last_response_ms)) < 30000;'
+            lambda: 'return id(pin_accepted) && id(skip_day) == 0 && !id(skip_release) && !id(apply_timer).is_running() && !id(synchronize_date_time).is_running() && id(pending_control) == 255 && !id(synchronize_clock).is_running() && id(last_response_ms) != 0 && (uint32_t)(millis() - id(last_response_ms)) < 30000;'
           then:
-            - uart.write:
-                id: mower_uart
-                data: [0x02, 0x0E, 0x01, 0x01, 0x6E, 0x03]
+            - script.execute:
+                id: send_control
+                command: 1
+          else:
             - text_sensor.template.publish:
                 id: last_control_command
-                state: "START requested"
-          else:
-            - logger.log:
-                level: WARN
-                format: "START blocked: PIN, missing connection or another command in progress"
+                state: "START blocked (PIN/connection/busy)"
   - platform: template
     name: "Refresh status"
     on_press:
@@ -883,8 +1345,55 @@ button:
           id: mower_uart
           data: [0x02, 0x12, 0x01, 0x01, 0x9F, 0x03]
 
-# Pause regular polling while a mode change or clock synchronization is running.
+# Keep status polling during control acknowledgement/readback; pause for clock sync.
 interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          const auto now = id(ha_time).now();
+          if (!now.is_valid()) return;
+          const uint32_t today = now.year * 10000UL + now.month * 100UL + now.day_of_month;
+          if (id(skip_day) != 0 && today > id(skip_day)) {
+            id(skip_day) = 0;
+            id(skip_release) = id(skip_restore_auto);
+            id(skip_last_attempt) = 0;
+            id(skip_status).publish_state(id(skip_release) ? "New day; waiting to restore AUTO" : "Skip ended; mode left unchanged");
+            id(persist_skip_state).execute();
+          }
+          if (id(skip_day) == 0 && !id(skip_release)) return;
+          if (id(skip_suspended)) {
+            id(skip_status).publish_state("Skip retained; automatic commands suspended by STOP");
+            return;
+          }
+          if (!id(pin_accepted) || id(last_status_ms) == 0 ||
+              (uint32_t)(millis() - id(last_status_ms)) >= 15000 ||
+              id(pending_control) != 255 || id(apply_timer).is_running() ||
+              id(synchronize_clock).is_running() || id(synchronize_date_time).is_running()) return;
+          if (id(skip_day) != 0 && id(operating_mode).state == "HOME") {
+            id(skip_status).publish_state("Skipping today; HOME mode observed"); return;
+          }
+          if (id(skip_release) && id(operating_mode).state == "AUTO") {
+            id(skip_release) = false; id(skip_restore_auto) = false;
+            id(skip_status).publish_state("Skip ended; AUTO mode observed");
+            id(persist_skip_state).execute(); return;
+          }
+          if (id(skip_release) && id(operating_status).state == "Error") return;
+          if (id(skip_last_attempt) != 0 && (uint32_t)(millis() - id(skip_last_attempt)) < 60000) return;
+          id(skip_last_attempt) = millis();
+          id(send_control)->execute(id(skip_day) != 0 ? 2 : 4);
+  - interval: 500ms
+    then:
+      - lambda: |-
+          if (id(pending_control) != 255 &&
+              (uint32_t)(millis() - id(control_sent_ms)) >= 20000) {
+            std::string result = id(control_label);
+            if (id(control_ack_ambiguous)) result += " sent; acknowledgement ambiguous after interrupted command";
+            else if (id(control_acknowledged)) result += " acknowledged; requested state not observed (timeout)";
+            else result += " not confirmed (acknowledgement timeout)";
+            if (id(pending_control) == 1) result += "; check mower display/physical START";
+            id(last_control_command).publish_state(result);
+            id(pending_control) = 255;
+          }
   - interval: 10s
     then:
       - lambda: |-
@@ -906,7 +1415,8 @@ interval:
           condition:
             lambda: |-
               return !id(change_mode).is_running() &&
-                     !id(synchronize_clock).is_running();
+                     !id(synchronize_clock).is_running() &&
+                     !id(apply_timer).is_running() && !id(synchronize_date_time).is_running();
           then:
             - lambda: |-
                 static const uint8_t status[]   = {0x02,0x12,0x01,0x01,0x9F,0x03};
@@ -954,17 +1464,48 @@ interval:
                   return;
                 }
 
-                static uint32_t last_request[6] = {0,0,0,0,0,0};
-                static const uint32_t periods[6] = {
-                  5000, 10000, 10000, 60000, 60000, 3600000
+                static const uint8_t timer1_start[] = {0x02,0x06,0x02,0x01,0x01,0xDC,0x03};
+                static const uint8_t timer1_end[] = {0x02,0x06,0x02,0x01,0x81,0x50,0x03};
+                static const uint8_t timer2_start[] = {0x02,0x06,0x02,0x01,0x02,0x3E,0x03};
+                static const uint8_t timer2_end[] = {0x02,0x06,0x02,0x01,0x82,0xB2,0x03};
+                static uint32_t last_request[10] = {0,0,0,0,0,0};
+                static const uint32_t periods[10] = {
+                  5000, 10000, 10000, 60000, 60000, 3600000, 60000, 60000, 60000, 60000
                 };
-                const uint8_t *messages[6] = {
-                  sensors, battery, cover, clock, next_start, date
+                const uint8_t *messages[10] = {
+                  sensors, battery, cover, clock, next_start, date,
+                  timer1_start, timer1_end, timer2_start, timer2_end
                 };
-                for (uint8_t i = 0; i < 6; i++) {
+                for (uint8_t i = 0; i < 10; i++) {
                   if (last_request[i] == 0 || (uint32_t)(now_ms - last_request[i]) >= periods[i]) {
-                    id(mower_uart).write_array(messages[i], 6);
+                    id(mower_uart).write_array(messages[i], i < 6 ? 6 : 7);
                     last_request[i] = now_ms;
                     break;
                   }
                 }
+
+# Draft values do not send UART commands. Load, edit, then explicitly Apply.
+text:
+  - platform: template
+    name: "Timer draft time"
+    id: timer_draft_time
+    mode: text
+    optimistic: true
+    min_length: 5
+    max_length: 5
+    initial_value: "00:00"
+  - platform: template
+    name: "Timer draft weekdays"
+    id: timer_draft_days
+    mode: text
+    optimistic: true
+    max_length: 27
+    initial_value: "Mon,Tue,Wed,Thu,Fri,Sat,Sun"
+
+switch:
+  - platform: template
+    name: "Allow experimental timer changes"
+    id: allow_timer_changes
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config

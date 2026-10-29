@@ -1,34 +1,24 @@
-# Validation
+# v3.10-test1 validation
 
-Validated on 2026-10-28 with ESPHome 2026.10.1, using disposable test credentials only.
+Date: 2026-10-28. Configuration: ESP32-C3 / ESPHome 2026.10.1 / ESP-IDF 5.5.6. Only disposable credentials were used for build checks.
 
-## Passed
+- ESPHome configuration validation and C++ generation passed.
+- Missing Secrets block validation; a quoted leading-zero test PIN survives code generation.
+- All 22 static UART frames passed length and Dallas CRC8 checks.
+- 17 compile-time C++ tests passed for the actual draft time/weekday parser extracted from the YAML. These cover normal times, 24:00, all-day masks, empty day lists, malformed times, invalid ranges, duplicate/unknown weekdays, spaces and extra commas. The tests remove UI reporting only; the parsing logic is taken from the deliverable.
 
-- ESPHome configuration validation of the English YAML.
-- ESPHome C++ source generation (`compile --only-generate`). This is not a full firmware build.
-- Full ESP32-C3 / ESP-IDF 5.5.6 firmware compilation succeeded using the English configuration and disposable test credentials. RAM: 103,189 / 321,296 bytes (32.1%). Flash: 831,387 / 1,835,008 bytes (45.3%). Test firmware is not distributed.
-- Missing `secrets.yaml` prevents validation.
-- A leading-zero test PIN remains a four-character string in generated C++.
-- All 17 static UART frames have valid lengths and Dallas CRC8 checksums. This verifies framing, not the meaning of the commands.
-- The original personal PIN, API key and private subnet are absent from the distribution files.
-- Git ignore rules exclude `secrets.yaml`, build folders and firmware binaries.
+Full firmware compilation passed. RAM: 105,493 / 321,296 bytes (32.8%); flash: 873,735 / 1,835,008 bytes (47.6%). The final source matches the compiled candidate. Source distribution was checked for the original private PIN, API key and private network address; none are included.
 
-## Limitations
+## Limits
 
-- No firmware has been installed on a device and no physical mower test has been performed for this edition.
-- Original hardware observations are reported by the owner, not independently repeated here. AUX1 pin 6 is confirmed by the owner as 5 V; the owner also reports that this supply turns off during sleep, powering off the ESP32 and preventing remote wake-up. Current capacity remains unquantified.
-- ESPHome 2026.10.1 accepts the OTA password configuration but emits a recommendation to use OTA encryption instead to reduce flash/RAM use. API encryption remains configured separately.
-- The Windows build emitted long-path warnings while configuring the bootloader, but the complete build succeeded.
+No physical test of the new date writes, timer writes or persistent skip workflow has been performed here. Input tests and compilation do not test the full UART state machine, acknowledgement timing, flash persistence or mower motion. The earlier owner log confirmed PIN acceptance, normal readings, and timer responses on v3.9-test1, but did not confirm weekdays or next-start interpretation against the mower display.
 
-## Repeat the checks
-
-Install `requirements-dev.txt`, then run:
+## Repeat
 
 ```sh
 python check_frames.py
 python check_config.py
+python check_cpp_logic.py /path/to/a/c++20/compiler
 ```
 
-`check_config.py` creates a temporary copy with disposable credentials, verifies missing-secrets failure, validates the configuration and generates C++. It does not upload firmware or contact a mower.
-
-For a full firmware build, configure your private `secrets.yaml` locally and run `esphome compile automower-310.yaml`, or select Install in ESPHome Device Builder. Never publish the resulting firmware or generated source: they contain your secrets.
+The C++ input tests use static assertions and can run with the ESP32 cross-compiler; no executable is run. `check_config.py` validates/generates with temporary test Secrets. It does not compile or flash firmware. Build your private firmware in ESPHome Device Builder and follow TESTING.md. No firmware, actual Secrets, or generated C++ is included in the source package.

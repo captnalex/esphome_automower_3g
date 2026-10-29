@@ -6,6 +6,18 @@ An unofficial Home Assistant integration for the Husqvarna Automower 310, using 
 
 The repository name refers to Generation 3. Compatibility with every Gen3 model is **not** confirmed.
 
+## Latest update: v3.10-test1
+
+This experimental update adds timer endpoint editing, persistent **Skip mowing today**, and combined date/clock synchronization, all running on the ESP32. It also includes the v3.9 timer readings, readable next-start time and improved command acknowledgements. No rain automation is included; this can be added in Home Assistant later.
+
+**Test status:** the owner reports that the original Norwegian version works very well. Logs from the English v3.9 test confirm PIN acceptance, normal sensor readings and timer responses. The v3.10 source passes full compilation and input-validation tests, but complete physical verification of the new writes and next-day skip behavior remains pending. Compare weekday and next-start readings with the mower display before relying on them. Other Gen3 models may work but have not been tested.
+
+See [CHANGELOG.md](CHANGELOG.md), [TESTING.md](TESTING.md) for operation and testing, and [VALIDATION.md](VALIDATION.md) for exact checks.
+
+### Updating an existing installation
+
+Back up your working YAML and keep your existing device name, Wi-Fi, API encryption, OTA password and any static-IP settings. Replace the complete device YAML rather than merging fragments, then restore those local settings. Existing Secrets names may differ from the generic names in this repository. Keep the actual credentials unchanged. The original private v3.8 file had no OTA password; the shareable edition requires `ota_password` in Secrets. Never copy private values into GitHub.
+
 ## Set up everything in the ESPHome app
 
 You enter your Wi-Fi details, mower PIN and passwords locally in **ESPHome Device Builder** (the ESPHome app in Home Assistant). You do not need to put any credentials on GitHub.
@@ -103,9 +115,12 @@ UART: 115200 baud, 8 data bits, no parity, 1 stop bit.
 
 - Operating status and mode, battery, wheel and blade motor readings, collision/lift/tilt readings and diagnostics.
 - Distributed polling: status/wheels/blade approximately every 2 seconds; other data less often.
-- AUTO/MAN/HOME selection, separate START/STOP, PIN authentication and manual clock synchronization.
+- AUTO/MAN/HOME selection, separate START/STOP, PIN authentication and manual date/clock synchronization.
 - No GPS, wake relay or automatic START on boot. **A mode change may still cause movement**, depending on mower firmware.
-- Clock synchronization writes the time only, not the date or schedules. It requires accepted PIN, valid Home Assistant time and fresh Parked/Charging status. The original configuration reports successful testing while charging and rejection while mowing.
+- Date/clock synchronization preserves the mower display format and checks both writes by readback. It requires accepted PIN, valid Home Assistant time and fresh Parked/Charging status.
+- Timer editing is disabled after each boot until **Allow experimental timer changes** is enabled. Select an endpoint, Load, edit its time/days, then Apply. Each write changes one endpoint and is read back; it is not an atomic whole-week update.
+- **Skip mowing today** requests HOME without changing timer settings. The saved hold survives restarts. On the next local day, AUTO is restored only if the mower was previously in AUTO; this can cause movement. An unpowered ESP32 must first wake by other means. **Cancel skip today** can restore AUTO early; **Stop mower** disables automatic skip commands/resumption.
+- Control results distinguish sent commands, acknowledgements, observed states, rejection and timeout. An acknowledgement alone does not prove the mower moved or physically stopped.
 - After 60 seconds without a valid UART response, communication is marked lost. Existing readings may remain visible but are historical. When the mower enters sleep, AUX1 loses its 5 V supply and the ESP32 turns off, making the device unavailable in Home Assistant. **You cannot wake the mower from sleep through this integration**, because the ESP32 has no power. The mower must wake by its own supported means before the integration reconnects.
 - Automatic authentication requires a fresh response and is attempted once per session. If the PIN is rejected, check the configuration rather than repeatedly pressing Authenticate PIN. The mower's own lockout rules still apply.
 
@@ -117,10 +132,14 @@ The following list is taken from `automower-310.yaml`, including the controls, m
 
 | Entity | Unit / meaning |
 | --- | --- |
-| Synchronize clock | Write time only; requires valid HA time, PIN, fresh contact and Parked/Charging status |
+| Synchronize date and clock | Preserve display format; write/read back date and time while parked/charging |
+| Load timer for editing | Load the selected endpoint into draft inputs |
+| Apply timer endpoint | Explicitly write and read back one endpoint; requires editing enabled and parked/charging |
+| Skip mowing today | Request HOME until the next local day; persist the hold |
+| Cancel skip today | End the hold; may restore AUTO and cause movement |
 | Authenticate PIN | Send the configured PIN; never shows the PIN value |
 | Stop mower | Send STOP; not a physical emergency stop |
-| Start mower | Send START; requires PIN, fresh contact and no competing mode/clock command |
+| Start mower | Send START; requires PIN, fresh contact and no skip hold or competing settings/control transaction |
 | Refresh status | Request a new operating-status response |
 
 ### Mode selector
@@ -128,6 +147,17 @@ The following list is taken from `automower-310.yaml`, including the controls, m
 | Entity | Unit / meaning |
 | --- | --- |
 | Select operating mode | AUTO / MAN / HOME; changing mode may cause movement |
+
+### Timer editing inputs
+
+| Entity | Meaning |
+| --- | --- |
+| Timer endpoint to edit | Timer 1/2 start/end selector |
+| Timer draft time | HH:MM; 24:00 is the documented disabled endpoint |
+| Timer draft weekdays | Comma-separated Mon,Tue,Wed,Thu,Fri,Sat,Sun; no spaces; empty means no days |
+| Allow experimental timer changes | Opt-in switch; off after every reboot |
+
+Draft edits do not send commands. Load an endpoint before applying. See [TESTING.md](TESTING.md) for the full workflow and partial-write limitations.
 
 ### Numeric sensors
 
@@ -184,6 +214,11 @@ The following list is taken from `automower-310.yaml`, including the controls, m
 | Mower clock | HH:MM:SS |
 | Mower date | DD.MM.YYYY |
 | Next start (Unix time) | Unix timestamp as text, or Not scheduled |
+| Next start (local time) | Local date/time with UTC offset; compare with mower display |
+| Timer 1 start / Timer 1 end | Endpoint time, weekday list and enabled flag |
+| Timer 2 start / Timer 2 end | Endpoint time, weekday list and enabled flag |
+| Schedule edit result | Loaded draft, blocked input, write/readback result |
+| Skip today status | Requested/observed hold, cancellation and resumption status |
 
 ### Polling and publication intervals
 
@@ -193,13 +228,13 @@ The following list is taken from `automower-310.yaml`, including the controls, m
 | Collision, lift and tilt | About 5 s |
 | Battery percentage, voltage/current and cover | About 10 s |
 | Battery capacity/temperature | Read about every 10 s; published at most every 30 s |
-| Operating hours, mower clock and next start | About 60 s |
+| Operating hours, mower clock, next start and timer endpoints | About 60 s |
 | Mower date | About 1 hour |
 | Wi-Fi signal / ESP32 uptime | 30 s / 60 s |
 | UART diagnostic counters and response/status age | 10 s |
 | Missing UART contact while ESP32 is still powered | Status request about every 5 s |
 
-Status-derived binary sensors update with the corresponding response. Text states are event-driven. Polling is paused during mode changes and clock synchronization. Intervals are approximate; valid responses are required. **An unpowered ESP32 does not poll at all.**
+Status-derived binary sensors update with the corresponding response. Text states are event-driven. Normal polling is paused during date/clock and timer-write transactions. Status polling continues while awaiting control acknowledgement/readback. Intervals are approximate; valid responses are required. **An unpowered ESP32 does not poll at all.**
 
 ### Serial command reference (RS232/UART)
 
@@ -211,7 +246,9 @@ This table describes the subset used by this YAML. Page numbers refer to the PDF
 | --- | --- | --- |
 | Authenticate | `0C / 00 01 PIN-low PIN-high` | p. 6 |
 | Read clock / write clock | `02 / 00`; `02 / 80 HH MM SS` | p. 7 |
-| Read date | `02 / 01` | p. 8 |
+| Read/write date | `02 / 01`; `02 / 81 year-low year-high month day format` | pp. 8-9 |
+| Read timer endpoint | `06 / 01 endpoint` (01/81: Timer 1 start/end; 02/82: Timer 2 start/end) | pp. 22-25 |
+| Write timer endpoint | `06 / 02 endpoint hour 00 minute days A0 05` | pp. 26-31 |
 | HOME / MAN / AUTO | `0E / 02`, `03`, `04` | p. 32 |
 | STOP / START | `0E / 00`, `01` | Forum follow-up |
 | Next start | `06 / 05` | p. 34 |
@@ -239,7 +276,7 @@ Use API encryption and unique passwords on a trusted local network. Do not expos
 
 All entity labels, status messages and comments are in English. When migrating from the Norwegian configuration, entity IDs in Home Assistant may change or old entities may remain; update dashboards and automations as needed. Internal identifiers were also translated consistently.
 
-## Changes from v3.8
+## Original changes from v3.8
 
 - Personal PIN and API key replaced by `!secret` references; no original credentials are distributed.
 - Four-digit decimal PIN parsing, including leading zeros; invalid format sends no authentication.

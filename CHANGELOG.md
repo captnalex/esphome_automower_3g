@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.10-test1 - experimental public update (2026-10-29)
+
+- Add guarded timer endpoint editing: select, load, edit time/weekdays, explicitly apply, and verify by readback. Editing defaults off after reboot.
+- Add persistent Skip mowing today and cancellation, using HOME without changing the saved schedule. Restore AUTO next local day/next wake only when previously in AUTO. STOP cancels automatic resumption.
+- Synchronize date and clock together, preserve display format and distinguish complete confirmation from partial failure.
+- Add timer draft/result controls, skip status, English operation/testing instructions and migration guidance for existing Secrets.
+- Include 17 compile-time C++ input-parser tests. Full firmware compilation passes with ESPHome 2026.10.1.
+- Keep all credentials in Secrets in the public YAML. No rain automation or wake hardware was added.
+
+New writes, skip persistence and next-day behavior still require physical verification. The owner approved publication; this is not a declaration of complete hardware validation.
+
+## v3.9-test1 - included changes
+
+- Read both timer start/end endpoints and expose days/enabled state.
+- Show next start as local date/time while retaining the Unix text field.
+- Distinguish control requests, acknowledgement, observed status, rejection and timeout. Avoid claiming a physical stop from a UART acknowledgement.
+- Owner logs show accepted PIN, normal readings and timer responses without recorded CRC/rejection errors. Weekday/next-start interpretation and command behavior remain to be checked against the mower.
+
 ## v3.8 - shareable English edition
 
 - Read the PIN and API encryption key from ESPHome Secrets.
