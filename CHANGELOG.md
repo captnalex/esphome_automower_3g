@@ -1,5 +1,11 @@
 # Changelog
 
+## Wheel polling at 200 ms (2026-10-30)
+
+- Read both wheels every 200 ms (five times per second). Use 100 ms slots in a 20-slot cycle, keeping status and blade polling at 2 seconds.
+- Retain 5-second disconnected status polling and existing pauses during settings transactions. The wheel response also includes power and current.
+
+
 ## Faster wheel polling (2026-10-30)
 
 - Read both wheels every 400 ms instead of every 2 seconds, using alternating slots in the existing 200 ms polling loop. Wheel speed, power and current share one response.

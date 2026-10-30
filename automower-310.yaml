@@ -8,7 +8,7 @@
 # No GPS, wake relay or automatic START on boot. A mode change may cause motion.
 # Manual date/clock sync; parked/charging status, accepted PIN and HA time required.
 # Original testing confirmed clock writes while charging, not while mowing.
-# One polling slot per 200 ms: wheels every 400 ms; status and blade every 2 seconds.
+# One polling slot per 100 ms: wheels every 200 ms; status and blade every 2 seconds.
 # Timer endpoints polled every 60 seconds. Explicit, guarded endpoint editing.
 # Other groups: sensors 5 s; battery/cover 10 s; clock/next start 60 s; date 1 hour.
 # After loss of communication: status polling every 5 seconds; no wake capability.
@@ -1409,7 +1409,7 @@ interval:
             id(operating_status).publish_state("No connection");
             ESP_LOGW("automower", "No valid UART response for 60 seconds");
           }
-  - interval: 200ms
+  - interval: 100ms
     then:
       - if:
           condition:
@@ -1441,7 +1441,7 @@ interval:
                     (uint32_t)(now_ms - id(last_response_ms)) < 60000;
                 static uint8_t no_connection_counter = 0;
                 if (!active_connection) {
-                  if (++no_connection_counter < 25) return;
+                  if (++no_connection_counter < 50) return;
                   no_connection_counter = 0;
                   id(mower_uart).write_array(status, sizeof(status));
                   return;
@@ -1450,7 +1450,7 @@ interval:
 
                 static uint8_t slot = 0;
                 const uint8_t current_slot = slot;
-                slot = (slot + 1) % 10;
+                slot = (slot + 1) % 20;
                 if (current_slot == 0) {
                   id(mower_uart).write_array(status, sizeof(status));
                   return;
