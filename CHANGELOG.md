@@ -1,5 +1,11 @@
 # Changelog
 
+## Faster wheel polling (2026-10-30)
+
+- Read both wheels every 400 ms instead of every 2 seconds, using alternating slots in the existing 200 ms polling loop. Wheel speed, power and current share one response.
+- Keep status and blade readings at 2 seconds, retain slots for slower data, and preserve pauses during settings transactions and disconnected polling behavior.
+
+
 ## Wheel speed unit correction (2026-10-30)
 
 - Correct left/right wheel speed units from rpm to mm/s, based on the owner's observation. The reported numeric value is unchanged: 394 is shown as 394 mm/s.
