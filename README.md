@@ -170,10 +170,10 @@ Draft edits do not send commands. Load an endpoint before applying. See [TESTING
 | Battery temperature | °C |
 | Operating hours | h |
 | Left wheel - power | % |
-| Left wheel - speed | rpm |
+| Left wheel - speed | mm/s |
 | Left wheel - current | mA |
 | Right wheel - power | % |
-| Right wheel - speed | rpm |
+| Right wheel - speed | mm/s |
 | Right wheel - current | mA |
 | Blade motor - speed | rpm |
 | Blade motor - current | mA |

@@ -718,7 +718,7 @@ sensor:
     update_interval: never
     name: "Left wheel - speed"
     id: left_speed
-    unit_of_measurement: "rpm"
+    unit_of_measurement: "mm/s"
     accuracy_decimals: 0
   - platform: template
     update_interval: never
@@ -736,7 +736,7 @@ sensor:
     update_interval: never
     name: "Right wheel - speed"
     id: right_speed
-    unit_of_measurement: "rpm"
+    unit_of_measurement: "mm/s"
     accuracy_decimals: 0
   - platform: template
     update_interval: never

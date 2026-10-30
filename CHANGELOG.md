@@ -1,5 +1,11 @@
 # Changelog
 
+## Wheel speed unit correction (2026-10-30)
+
+- Correct left/right wheel speed units from rpm to mm/s, based on the owner's observation. The reported numeric value is unchanged: 394 is shown as 394 mm/s.
+- Keep blade motor speed in rpm and preserve existing entity names/IDs.
+
+
 ## v3.10-test1 - public update (2026-10-29)
 
 - Add guarded timer endpoint editing: select, load, edit time/weekdays, explicitly apply, and verify by readback. Editing defaults off after reboot.
