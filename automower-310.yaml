@@ -319,12 +319,20 @@ uart:
                   return uint16_t(receive_buffer[index]) |
                          (uint16_t(receive_buffer[index + 1]) << 8);
                 };
-                id(left_power).publish_state(int16_t(word(4)));
+                // Both wheels share one UART response. Publish speed on every reply,
+                // but publish the latest power/current values at most once per second.
                 id(left_speed).publish_state(int16_t(word(6)));
-                id(left_current).publish_state(int16_t(word(8)));
-                id(right_power).publish_state(int16_t(word(10)));
                 id(right_speed).publish_state(int16_t(word(12)));
-                id(right_current).publish_state(int16_t(word(14)));
+                static bool wheel_aux_published = false;
+                static uint32_t last_wheel_aux_ms = 0;
+                if (!wheel_aux_published || (uint32_t)(now_ms - last_wheel_aux_ms) >= 1000) {
+                  id(left_power).publish_state(int16_t(word(4)));
+                  id(left_current).publish_state(int16_t(word(8)));
+                  id(right_power).publish_state(int16_t(word(10)));
+                  id(right_current).publish_state(int16_t(word(14)));
+                  last_wheel_aux_ms = now_ms;
+                  wheel_aux_published = true;
+                }
               } else if (data_length == 7) {
                 const uint16_t rpm = uint16_t(receive_buffer[4]) |
                                      (uint16_t(receive_buffer[5]) << 8);

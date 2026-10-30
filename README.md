@@ -114,7 +114,7 @@ UART: 115200 baud, 8 data bits, no parity, 1 stop bit.
 ## Features and behavior
 
 - Operating status and mode, battery, wheel and blade motor readings, collision/lift/tilt readings and diagnostics.
-- Distributed polling: wheel readings approximately every 0.2 seconds; status/blade every 2 seconds; other data less often.
+- Distributed polling: wheel speed approximately every 0.2 seconds; wheel power/current published every 1 second; status/blade every 2 seconds; other data less often.
 - AUTO/MAN/HOME selection, separate START/STOP, PIN authentication and manual date/clock synchronization.
 - No GPS, wake relay or automatic START on boot. **A mode change may still cause movement**, depending on mower firmware.
 - Date/clock synchronization preserves the mower display format and checks both writes by readback. It requires accepted PIN, valid Home Assistant time and fresh Parked/Charging status.
@@ -224,7 +224,8 @@ Draft edits do not send commands. Load an endpoint before applying. See [TESTING
 
 | Data group | Normal interval |
 | --- | --- |
-| Wheel speed, power and current (shared response for both wheels) | About 0.2 s |
+| Wheel speed (both wheels) | About 0.2 s |
+| Wheel power and current (both wheels) | Published at most every 1 s; latest values from the shared 0.2 s UART response |
 | Operating status/mode and blade motor readings | About 2 s |
 | Collision, lift and tilt | About 5 s |
 | Battery percentage, voltage/current and cover | About 10 s |

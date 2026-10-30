@@ -1,5 +1,12 @@
 # Changelog
 
+## Separate wheel publication intervals (2026-10-30)
+
+- Keep both wheel speeds updating on each 200 ms response.
+- Publish wheel power/current on the first valid response, then at most once per second using the latest values. UART requests still return all six wheel values together.
+- Preserve signed readings, existing entities and other polling intervals.
+
+
 ## Wheel polling at 200 ms (2026-10-30)
 
 - Read both wheels every 200 ms (five times per second). Use 100 ms slots in a 20-slot cycle, keeping status and blade polling at 2 seconds.
